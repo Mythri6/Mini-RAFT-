@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed RAFT Whiteboard</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="clusterStatus" class="status-badge healthy">
+        <i class="fa-solid fa-server"></i> <span id="statusText">Connected to Leader</span>
+    </div>
+
+    <div class="board-container">
+        <div class="toolbar">
+            <div class="tool-section">
+                <button id="penBtn" class="tool-btn active" title="Pen"><i class="fa-solid fa-pen"></i></button>
+                <button id="eraserBtn" class="tool-btn" title="Eraser"><i class="fa-solid fa-eraser"></i></button>
+                <button id="symmetryBtn" class="tool-btn" title="Mirror Drawing"><i class="fa-solid fa-arrows-left-right-to-line"></i></button>
+                <button id="clearBtn" class="tool-btn trash" title="Clear Board"><i class="fa-solid fa-trash-can"></i></button>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="weight-section" id="weightSelectors">
+                <div class="weight-btn" data-weight="2" style="width: 8px; height: 8px;"></div>
+                <div class="weight-btn active" data-weight="5" style="width: 14px; height: 14px;"></div>
+                <div class="weight-btn" data-weight="10" style="width: 20px; height: 20px;"></div>
+                <div class="weight-btn" data-weight="15" style="width: 26px; height: 26px;"></div>
+                <div class="weight-btn" data-weight="25" style="width: 32px; height: 32px;"></div>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="color-section">
+                <div class="color-grid" id="colorPalette">
+                    <div class="color-btn active" style="background-color: #000000;" data-color="#000000"></div>
+                    <div class="color-btn" style="background-color: #7f8c8d;" data-color="#7f8c8d"></div>
+                    <div class="color-btn" style="background-color: #e74c3c;" data-color="#e74c3c"></div>
+                    <div class="color-btn" style="background-color: #e67e22;" data-color="#e67e22"></div>
+                    <div class="color-btn" style="background-color: #f1c40f;" data-color="#f1c40f"></div>
+                    <div class="color-btn" style="background-color: #2ecc71;" data-color="#2ecc71"></div>
+                    <div class="color-btn" style="background-color: #3498db;" data-color="#3498db"></div>
+                    <div class="color-btn" style="background-color: #9b59b6;" data-color="#9b59b6"></div>
+                    <div class="color-btn" style="background-color: #ecf0f1;" data-color="#ecf0f1"></div>
+                    <div class="color-btn" style="background-color: #fd79a8;" data-color="#fd79a8"></div>
+                </div>
+                <div class="custom-color-wrapper">
+                    <input type="color" id="customColorPicker" title="Custom Color & Dropper">
+                </div>
+            </div>
+        </div>
+
+        <div class="canvas-frame" id="canvasFrame">
+            <canvas id="drawingCanvas" class="cursor-pen"></canvas>
+            </div>
+    </div>
+    
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

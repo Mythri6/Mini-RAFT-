@@ -1,0 +1,119 @@
+body {
+    display: flex;
+    justify-content: center;
+    background-color: #2c3e50;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 30px;
+}
+
+/* Cluster Status HUD */
+.status-badge {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    padding: 10px 20px;
+    border-radius: 20px;
+    color: white;
+    font-weight: bold;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    transition: background-color 0.3s ease;
+    z-index: 1000;
+}
+.status-badge.healthy { background-color: #2ecc71; }
+.status-badge.chaotic { background-color: #e74c3c; animation: pulse 1s infinite; }
+
+@keyframes pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.05); }
+    100% { transform: scale(1); }
+}
+
+.board-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+/* UI Toolbar */
+.toolbar {
+    display: flex;
+    align-items: center;
+    background: #ffffff;
+    padding: 12px 24px;
+    border-radius: 50px;
+    margin-bottom: 25px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+    gap: 20px;
+    border: 1px solid #e0e0e0;
+}
+
+.divider { width: 2px; height: 35px; background-color: #ecf0f1; border-radius: 2px; }
+
+/* Tool Icons */
+.tool-section { display: flex; gap: 8px; }
+.tool-btn {
+    font-size: 20px; background: none; border: none; color: #7f8c8d;
+    cursor: pointer; width: 45px; height: 45px; border-radius: 50%;
+    transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+.tool-btn:hover { color: #2c3e50; background: #ecf0f1; }
+.tool-btn.active { color: white; background: #3498db; transform: scale(1.15); box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4); }
+.tool-btn.trash:hover { color: white; background: #e74c3c; transform: scale(1.15); }
+
+/* Weights & Colors */
+.weight-section { display: flex; align-items: center; gap: 15px; }
+.weight-btn { background-color: #34495e; border-radius: 50%; cursor: pointer; transition: transform 0.2s, background-color 0.2s; }
+.weight-btn:hover { transform: scale(1.2); }
+.weight-btn.active { background-color: #3498db; box-shadow: 0 0 0 3px #bbdefb; transform: scale(1.2); }
+
+.color-section { display: flex; align-items: center; gap: 15px; }
+.color-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.color-btn { width: 22px; height: 22px; border-radius: 50%; cursor: pointer; box-shadow: inset 0 2px 4px rgba(0,0,0,0.2); transition: transform 0.1s; }
+.color-btn.active { border: 2px solid white; box-shadow: 0 0 0 2px #34495e; transform: scale(1.2); }
+#customColorPicker { width: 40px; height: 40px; border: none; cursor: pointer; background: none; }
+
+/* The Whiteboard Frame & Dot Grid */
+.canvas-frame {
+    position: relative; /* Needed for positioning remote cursors */
+    padding: 15px;
+    background: #bdc3c7;
+    border-radius: 12px;
+    box-shadow: 0 15px 35px rgba(0,0,0,0.5), inset 0 2px 5px rgba(255,255,255,0.5);
+}
+
+canvas {
+    background-color: #ffffff;
+    background-image: radial-gradient(#bdc3c7 1px, transparent 1px);
+    background-size: 25px 25px;
+    border-radius: 4px;
+    display: block;
+    box-shadow: inset 0 0 10px rgba(0,0,0,0.05);
+}
+
+.cursor-pen { cursor: crosshair; }
+.cursor-eraser { cursor: cell; }
+
+/* Multiplayer Live Cursors */
+.remote-cursor {
+    position: absolute;
+    pointer-events: none; /* Ignore mouse clicks on the fake cursor */
+    z-index: 100;
+    transition: top 0.05s linear, left 0.05s linear; /* Smooths out network jitter */
+    display: flex;
+    flex-direction: column;
+}
+.remote-cursor i {
+    color: #e74c3c;
+    font-size: 18px;
+    filter: drop-shadow(0px 2px 2px rgba(0,0,0,0.4));
+}
+.remote-cursor span {
+    background-color: #e74c3c;
+    color: white;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    margin-top: 4px;
+    margin-left: 10px;
+}

@@ -1,0 +1,32 @@
+version: '3.8'
+services:
+  gateway:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./gateway:/app  # Bind mount for hot-reload
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - raft_network
+
+  # Your teammates will fill in the details for these, 
+  # but setting them up here creates the shared network!
+  replica1:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./replica1:/app
+    environment:
+      - REPLICA_ID=1
+      - PORT=8081
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - raft_network
+
+  # (Repeat similar blocks for replica2 and replica3)
+
+networks:
+  raft_network:
+    driver: bridge
