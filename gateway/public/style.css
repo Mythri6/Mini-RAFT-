@@ -60,6 +60,7 @@ body {
 .tool-btn:hover { color: #2c3e50; background: #ecf0f1; }
 .tool-btn.active { color: white; background: #3498db; transform: scale(1.15); box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4); }
 .tool-btn.trash:hover { color: white; background: #e74c3c; transform: scale(1.15); }
+.tool-btn.leave-btn:hover { color: white; background: #e74c3c; transform: scale(1.15); }
 
 /* Weights & Colors */
 .weight-section { display: flex; align-items: center; gap: 15px; }
@@ -117,3 +118,90 @@ canvas {
     margin-top: 4px;
     margin-left: 10px;
 }
+/* --- LOBBY & ROOM UI --- */
+.hidden { display: none !important; }
+
+.login-overlay {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: rgba(44, 62, 80, 0.95);
+    display: flex; justify-content: center; align-items: center;
+    z-index: 2000;
+}
+
+.login-modal {
+    background: white; padding: 40px; border-radius: 16px;
+    box-shadow: 0 15px 35px rgba(0,0,0,0.5);
+    display: flex; flex-direction: column; gap: 15px; width: 320px;
+    text-align: center;
+}
+
+.login-modal h2 { margin: 0; color: #2c3e50; font-size: 24px; }
+.login-modal p { margin: 0 0 10px 0; color: #7f8c8d; font-size: 14px; }
+
+.login-modal input {
+    padding: 12px; border: 2px solid #ecf0f1; border-radius: 8px;
+    font-size: 16px; outline: none; transition: border 0.2s;
+}
+
+.login-modal input:focus { border: 2px solid #3498db; }
+
+.login-modal button {
+    padding: 14px; background: #3498db; color: white; border: none;
+    border-radius: 8px; font-size: 16px; cursor: pointer; font-weight: bold;
+    transition: background 0.2s, transform 0.1s;
+}
+
+.login-modal button:hover { background: #2980b9; }
+.login-modal button:active { transform: scale(0.98); }
+
+.room-badge {
+    background: #e67e22; color: white; padding: 8px 16px;
+    border-radius: 20px; font-weight: bold; font-size: 14px;
+    display: flex; align-items: center; gap: 8px;
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,0.1);
+}
+/* --- LOBBY UPGRADES --- */
+.lobby-actions { display: flex; flex-direction: column; gap: 15px; margin-top: 10px; }
+.action-btn { padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
+.action-btn.create { background: #9b59b6; font-size: 16px; }
+.action-btn.create:hover { background: #8e44ad; }
+.action-btn.join { background: #2ecc71; border-radius: 0 8px 8px 0; }
+.action-btn.join:hover { background: #27ae60; }
+.join-group { display: flex; }
+.join-group input { border-radius: 8px 0 0 8px; border-right: none; flex-grow: 1; text-transform: uppercase; }
+.divider-text { text-align: center; color: #95a5a6; font-size: 12px; font-weight: bold; position: relative; }
+.divider-text::before, .divider-text::after { content: ""; position: absolute; top: 50%; width: 40%; height: 1px; background: #ecf0f1; }
+.divider-text::before { left: 0; }
+.divider-text::after { right: 0; }
+
+/* --- SIDEBAR & WORKSPACE --- */
+.workspace { display: flex; gap: 20px; width: 100%; max-width: 1200px; }
+
+.user-sidebar {
+    background: white; padding: 15px; border-radius: 12px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 200px;
+    display: flex; flex-direction: column; max-height: 630px;
+}
+.user-sidebar h3 { margin: 0 0 15px 0; font-size: 16px; color: #2c3e50; border-bottom: 2px solid #ecf0f1; padding-bottom: 10px; }
+
+.user-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+.user-card {
+    display: flex; align-items: center; gap: 10px;
+    background: #ecf0f1; padding: 8px; border-radius: 8px;
+    font-weight: bold; font-size: 14px; color: #34495e;
+}
+.user-card img { width: 35px; height: 35px; border-radius: 50%; background: #bdc3c7; border: 2px solid white; }
+/* --- COPY BUTTON --- */
+.copy-btn {
+    background: rgba(255, 255, 255, 0.2); /* Semi-transparent white */
+    border: none;
+    color: white;
+    border-radius: 4px;
+    padding: 4px 8px;
+    margin-left: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.copy-btn:hover { background: rgba(255, 255, 255, 0.4); }
+.copy-btn:active { transform: scale(0.9); } /* Cute little click animation */
