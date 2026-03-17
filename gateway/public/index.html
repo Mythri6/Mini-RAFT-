@@ -8,12 +8,39 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <div id="loginScreen" class="login-overlay">
+        <div class="login-modal">
+            <h2><i class="fa-solid fa-palette"></i> Whiteboard</h2>
+            <input type="text" id="usernameInput" placeholder="Your Name" autocomplete="off">
+            
+            <div class="lobby-actions">
+                <button id="createRoomBtn" class="action-btn create"><i class="fa-solid fa-wand-magic-sparkles"></i> Create New Room</button>
+                
+                <div class="divider-text"><span>OR</span></div>
+                
+                <div class="join-group">
+                    <input type="text" id="roomInput" placeholder="5-Letter Code" maxlength="5" autocomplete="off">
+                    <button id="joinBtn" class="action-btn join">Join Room</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="clusterStatus" class="status-badge healthy">
         <i class="fa-solid fa-server"></i> <span id="statusText">Connected to Leader</span>
     </div>
 
-    <div class="board-container">
+    <div class="board-container hidden" id="boardContainer">
+        
         <div class="toolbar">
+            <div class="room-badge" title="Share this code with friends!">
+                <i class="fa-solid fa-door-open"></i> Room: <span id="displayRoomId">---</span>
+                <button id="copyRoomBtn" class="copy-btn" title="Copy to Clipboard"><i class="fa-regular fa-copy"></i></button>
+            </div>
+            <button id="leaveRoomBtn" class="tool-btn leave-btn" title="Leave Room"><i class="fa-solid fa-right-from-bracket"></i></button>
+
+            <div class="divider"></div>
+
             <div class="tool-section">
                 <button id="penBtn" class="tool-btn active" title="Pen"><i class="fa-solid fa-pen"></i></button>
                 <button id="eraserBtn" class="tool-btn" title="Eraser"><i class="fa-solid fa-eraser"></i></button>
@@ -52,9 +79,17 @@
             </div>
         </div>
 
-        <div class="canvas-frame" id="canvasFrame">
-            <canvas id="drawingCanvas" class="cursor-pen"></canvas>
+        <div class="workspace">
+            <div class="user-sidebar">
+                <h3><i class="fa-solid fa-users"></i> Players</h3>
+                <div id="userList" class="user-list">
+                    </div>
             </div>
+
+            <div class="canvas-frame" id="canvasFrame">
+                <canvas id="drawingCanvas" class="cursor-pen"></canvas>
+            </div>
+        </div>
     </div>
     
     <script src="/socket.io/socket.io.js"></script>

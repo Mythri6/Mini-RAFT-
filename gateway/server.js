@@ -37,62 +37,86 @@ app.post('/broadcast', (req, res) => {
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
 
-    // Broadcast live cursor movements
-    socket.on('cursor-move', (data) => {
-        socket.broadcast.emit('cursor-move', data);
+    // Helper function to tell the room who is currently inside
+    const broadcastUserList = async (roomId) => {
+        const sockets = await io.in(roomId).fetchSockets();
+        const users = sockets.map(s => ({ id: s.id, name: s.userName }));
+        io.to(roomId).emit('room-users-update', users);
+    };
+
+    // 1. Join Room
+    socket.on('join-room', async (data) => {
+        socket.join(data.roomId);
+        socket.roomId = data.roomId; // Attach it to the socket for easy access
+        socket.userName = data.userName;
+        console.log(`${data.userName} joined room: ${data.roomId}`);
+        
+        // Tell everyone the new player list!
+        await broadcastUserList(data.roomId);
     });
 
+    // 2. Leave Room
+    socket.on('leave-room', async (data) => {
+        socket.leave(data.roomId);
+        socket.to(data.roomId).emit('cursor-disconnect', socket.id);
+        socket.roomId = null;
+        
+        // Update the sidebar for the people left behind
+        await broadcastUserList(data.roomId);
+    });
+
+    // 3. Disconnect completely
+    socket.on('disconnect', async () => {
+        console.log('Client disconnected:', socket.id);
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('cursor-disconnect', socket.id);
+            const tempRoom = socket.roomId;
+            socket.leave(socket.roomId);
+            await broadcastUserList(tempRoom);
+        }
+    });
+
+    // 4. Only broadcast cursors to people in the SAME room
+    socket.on('cursor-move', (data) => {
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('cursor-move', data);
+        }
+    });
+
+    // 5. Broadcast strokes to people in the SAME room & handle RAFT failover
     socket.on('draw-stroke', async (strokeData) => {
-        // Broadcast immediately for UI smoothness
-        socket.broadcast.emit('remote-stroke', strokeData); 
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('remote-stroke', strokeData); 
+        }
 
         try {
-            // Attempt to send to RAFT leader
-            await axios.post(`${currentLeader}/append-entries`, strokeData);
+            await axios.post(`${currentLeader}/client-stroke`, strokeData);
             socket.emit('leader-status', { status: 'healthy', msg: `Connected to Leader (${currentLeader})` });
-            
         } catch (error) {
-            // 1. Trigger the red Chaos HUD on the frontend
             socket.emit('leader-status', { status: 'chaotic', msg: '⚠️ LEADER DOWN! Re-electing...' });
             
-            // 2. Prevent multiple strokes from triggering 50 searches at once
+            // Failover loop
             if (isSearchingForLeader) return;
             isSearchingForLeader = true;
-            
-            console.log(`Leader ${currentLeader} failed. Searching for new leader...`);
-
-            // 3. Ping the cluster to find the new leader
             for (const node of clusterNodes) {
                 try {
-                    // We assume Role 4 is building a GET /status endpoint
                     const response = await axios.get(`${node}/status`, { timeout: 1000 });
-                    
                     if (response.data && response.data.state === 'LEADER') {
-                        currentLeader = node; // REROUTE SUCCESSFUL!
-                        console.log(`Found new leader: ${currentLeader}`);
-                        
-                        // Tell the UI the system recovered
+                        currentLeader = node;
                         socket.emit('leader-status', { status: 'healthy', msg: `Recovered! New Leader: ${currentLeader}` });
                         break; 
                     }
-                } catch (pingError) {
-                    // This node is either dead or not ready, skip it
-                    console.log(`Node ${node} is unreachable or not leader.`);
-                }
+                } catch (pingError) {}
             }
-            
             isSearchingForLeader = false;
         }
     });
 
+    // 6. Only clear the canvas for the SAME room
     socket.on('clear-canvas', () => {
-        socket.broadcast.emit('clear-canvas');
-    });
-
-    socket.on('disconnect', () => {
-        console.log('Client disconnected');
-        // Tell clients to remove this person's cursor
-        socket.broadcast.emit('cursor-disconnect', socket.id); 
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('clear-canvas');
+        }
     });
 });
 
