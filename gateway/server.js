@@ -34,88 +34,111 @@ app.post('/broadcast', (req, res) => {
     res.status(200).send("Broadcast successful");
 });
 
+// Keep track of which rooms actually exist
+const activeRooms = new Set();
+
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
 
-    // Helper function to tell the room who is currently inside
     const broadcastUserList = async (roomId) => {
         const sockets = await io.in(roomId).fetchSockets();
         const users = sockets.map(s => ({ id: s.id, name: s.userName }));
         io.to(roomId).emit('room-users-update', users);
     };
 
-    // 1. Join Room
-    socket.on('join-room', async (data) => {
-        socket.join(data.roomId);
-        socket.roomId = data.roomId; // Attach it to the socket for easy access
-        socket.userName = data.userName;
-        console.log(`${data.userName} joined room: ${data.roomId}`);
+    // --- UPGRADE: Tweak 2 (Create vs Join Bouncer) ---
+    socket.on('join-room', async (data, callback) => { // Notice the "callback" added here!
+        const { roomId, userName, isCreating } = data;
+
+        if (!isCreating && !activeRooms.has(roomId)) {
+            // Reject! Room doesn't exist
+            return callback({ success: false, message: "Room not found!" });
+        }
+
+        // If creating, add it to our official list
+        if (isCreating) activeRooms.add(roomId);
+
+        socket.join(roomId);
+        socket.roomId = roomId;
+        socket.userName = userName;
         
-        // Tell everyone the new player list!
-        await broadcastUserList(data.roomId);
+        try {
+            // Tell the leader we only want the history for THIS room
+            const response = await axios.get(`${currentLeader}/canvas/${roomId}`);
+            socket.emit('canvas-history', response.data.log);
+        } catch (error) {}
+
+        await broadcastUserList(roomId);
+        callback({ success: true }); // Let the frontend know they got in safely
     });
 
-    // 2. Leave Room
+    // --- UPGRADE: Tweak 3 (Delete Room When Empty) ---
     socket.on('leave-room', async (data) => {
         socket.leave(data.roomId);
         socket.to(data.roomId).emit('cursor-disconnect', socket.id);
         socket.roomId = null;
-        
-        // Update the sidebar for the people left behind
         await broadcastUserList(data.roomId);
+        checkAndCleanUpRoom(data.roomId);
     });
 
-    // 3. Disconnect completely
     socket.on('disconnect', async () => {
-        console.log('Client disconnected:', socket.id);
         if (socket.roomId) {
             socket.to(socket.roomId).emit('cursor-disconnect', socket.id);
             const tempRoom = socket.roomId;
             socket.leave(socket.roomId);
             await broadcastUserList(tempRoom);
+            checkAndCleanUpRoom(tempRoom);
         }
     });
 
-    // 4. Only broadcast cursors to people in the SAME room
-    socket.on('cursor-move', (data) => {
-        if (socket.roomId) {
-            socket.to(socket.roomId).emit('cursor-move', data);
+    // Helper to delete the room if the last person leaves
+    async function checkAndCleanUpRoom(roomId) {
+        const room = io.sockets.adapter.rooms.get(roomId);
+        if (!room || room.size === 0) {
+            console.log(`Room ${roomId} is empty. Deleting...`);
+            activeRooms.delete(roomId);
+            // Tell the RAFT cluster to wipe it from memory
+            try { await axios.delete(`${currentLeader}/room/${roomId}`); } catch(e){}
         }
-    });
+    }
 
-    // 5. Broadcast strokes to people in the SAME room & handle RAFT failover
+    socket.on('cursor-move', (data) => { if (socket.roomId) socket.to(socket.roomId).emit('cursor-move', data); });
     socket.on('draw-stroke', async (strokeData) => {
-        if (socket.roomId) {
-            socket.to(socket.roomId).emit('remote-stroke', strokeData); 
-        }
-
+        if (socket.roomId) socket.to(socket.roomId).emit('remote-stroke', strokeData); 
         try {
             await axios.post(`${currentLeader}/client-stroke`, strokeData);
             socket.emit('leader-status', { status: 'healthy', msg: `Connected to Leader (${currentLeader})` });
         } catch (error) {
             socket.emit('leader-status', { status: 'chaotic', msg: '⚠️ LEADER DOWN! Re-electing...' });
-            
-            // Failover loop
-            if (isSearchingForLeader) return;
-            isSearchingForLeader = true;
-            for (const node of clusterNodes) {
-                try {
-                    const response = await axios.get(`${node}/status`, { timeout: 1000 });
-                    if (response.data && response.data.state === 'LEADER') {
-                        currentLeader = node;
-                        socket.emit('leader-status', { status: 'healthy', msg: `Recovered! New Leader: ${currentLeader}` });
-                        break; 
-                    }
-                } catch (pingError) {}
-            }
-            isSearchingForLeader = false;
         }
     });
-
-    // 6. Only clear the canvas for the SAME room
-    socket.on('clear-canvas', () => {
+    // Tell the Leader to forget the drawings
+    socket.on('clear-canvas', async () => { 
         if (socket.roomId) {
-            socket.to(socket.roomId).emit('clear-canvas');
+            socket.to(socket.roomId).emit('clear-canvas'); 
+            
+            try { 
+                // Hit your brand new Replica endpoint
+                await axios.delete(`${currentLeader}/canvas/${socket.roomId}`); 
+            } catch(error) {}
+        }
+    });
+    // --- UPGRADE: The Undo Feature ---
+    socket.on('undo-stroke', async () => {
+        if (!socket.roomId || !socket.userName) return;
+
+        try {
+            // Tell the Leader to delete the stroke from memory
+            await axios.delete(`${currentLeader}/undo/${socket.roomId}/${socket.userName}`);
+            
+            // Ask the Leader for the newly updated, fixed array
+            const response = await axios.get(`${currentLeader}/canvas/${socket.roomId}`);
+            
+            // Tell EVERYONE in the room to clear their board and redraw the fixed history!
+            io.to(socket.roomId).emit('clear-canvas');
+            io.to(socket.roomId).emit('canvas-history', response.data.log);
+        } catch (error) {
+            console.log("Undo failed.");
         }
     });
 });

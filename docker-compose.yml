@@ -7,25 +7,52 @@ services:
       - ./gateway:/app  # Bind mount for hot-reload
     ports:
       - "3000:3000"
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm run dev"
     networks:
       - raft_network
 
-  # Your teammates will fill in the details for these, 
-  # but setting them up here creates the shared network!
+  # --- THE RAFT CLUSTER ---
   replica1:
     image: node:18-alpine
     working_dir: /app
     volumes:
-      - ./replica1:/app
+      - ./replica:/app  # Notice this points to a shared "replica" folder
     environment:
       - REPLICA_ID=1
       - PORT=8081
+    ports:
+      - "8081:8081"
     command: sh -c "npm install && npm run dev"
     networks:
       - raft_network
 
-  # (Repeat similar blocks for replica2 and replica3)
+  replica2:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./replica:/app
+    environment:
+      - REPLICA_ID=2
+      - PORT=8082
+    ports:
+      - "8082:8082"
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - raft_network
+
+  replica3:
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./replica:/app
+    environment:
+      - REPLICA_ID=3
+      - PORT=8083
+    ports:
+      - "8083:8083"
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - raft_network
 
 networks:
   raft_network:

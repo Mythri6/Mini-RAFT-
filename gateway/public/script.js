@@ -5,6 +5,10 @@ const socket = io();
 // --- LOBBY LOGIC ---
 let myUserName = '';
 let myRoomId = '';
+let lastEmitTime = 0;
+let lastEmitX = 0; // Track the X coordinate of the last network emit
+let lastEmitY = 0; // Track the Y coordinate of the last network emit
+let currentStrokeBatchId = null; // Groups a full mouse-drag together
 
 const loginScreen = document.getElementById('loginScreen');
 const boardContainer = document.getElementById('boardContainer');
@@ -19,34 +23,43 @@ function generateRoomCode() {
     return code;
 }
 
-function enterRoom(roomId) {
+function enterRoom(roomId, isCreating) {
     const name = nameInput.value.trim();
     if (!name) return alert("Please enter your name first!");
 
     myUserName = name;
     myRoomId = roomId.toUpperCase();
 
-    loginScreen.classList.add('hidden');
-    boardContainer.classList.remove('hidden');
-    displayRoomId.innerText = myRoomId;
+    // 1. Ask the Gateway if we can come in, and pass the isCreating flag!
+    socket.emit('join-room', { roomId: myRoomId, userName: myUserName, isCreating: isCreating }, (response) => {
+        
+        // 2. The Gateway said NO (Fake room!)
+        if (!response.success) {
+            alert(response.message); 
+            return; 
+        }
 
-    socket.emit('join-room', { roomId: myRoomId, userName: myUserName });
+        // 3. The Gateway said YES, so NOW we finally show the whiteboard
+        loginScreen.classList.add('hidden');
+        boardContainer.classList.remove('hidden');
+        displayRoomId.innerText = myRoomId;
+    });
 }
 
-// Button: Create New Room
+// Button: Create New Room (Tells enterRoom that isCreating = true)
 document.getElementById('createRoomBtn').addEventListener('click', () => {
-    enterRoom(generateRoomCode());
+    enterRoom(generateRoomCode(), true);
 });
 
-// Button: Join Existing Room
+// Button: Join Existing Room (Tells enterRoom that isCreating = false)
 document.getElementById('joinBtn').addEventListener('click', () => {
     const code = document.getElementById('roomInput').value;
     if (code.length < 5) return alert("Please enter a valid 5-character room code.");
-    enterRoom(code);
+    enterRoom(code, false);
 });
 
-// --- NEW: Render the User Sidebar with Bot Avatars! ---
-// --- NEW: Render the User Sidebar with Mixed Avatars! ---
+
+// --- Render the User Sidebar with Mixed Avatars! ---
 socket.on('room-users-update', (users) => {
     const sidebar = document.getElementById('userList');
     sidebar.innerHTML = ''; // Clear the old list
@@ -236,26 +249,35 @@ function drawLine(startX, startY, endX, endY, color, thickness, tool) {
 }
 
 function emitStroke(startX, startY, endX, endY) {
-    const strokeData = {
-        strokeId: generateUUID(),
-        roomId: myRoomId,
-        userName: myUserName,
-        startX: startX,
-        startY: startY,
-        endX: endX,
-        endY: endY,
-        color: currentColor,
-        thickness: parseInt(currentWidth),
-        tool: currentTool 
-    };
-    console.log("Sending JSON Payload:", strokeData);
-    socket.emit('draw-stroke', strokeData);
+    const now = Date.now();
+    
+    if (now - lastEmitTime > 10) {
+        const strokeData = {
+            strokeId: currentStrokeBatchId, // USE THE BATCH ID
+            roomId: myRoomId,
+            userName: myUserName,
+            startX: startX, 
+            startY: startY,
+            endX: endX,
+            endY: endY,
+            color: currentColor,
+            thickness: parseInt(currentWidth),
+            tool: currentTool 
+        };
+        
+        socket.emit('draw-stroke', strokeData);
+    }
 }
 
 canvas.addEventListener('mousedown', (e) => {
     isDrawing = true;
     lastX = e.offsetX;
     lastY = e.offsetY;
+
+    // Start a new batch and log the starting point for the network
+    currentStrokeBatchId = generateUUID(); 
+    lastEmitX = lastX;
+    lastEmitY = lastY;
 });
 
 canvas.addEventListener('mousemove', (e) => {
@@ -269,18 +291,32 @@ canvas.addEventListener('mousemove', (e) => {
 
     if (!isDrawing) return;
 
+    // 1. NORMAL DRAWING
     drawLine(lastX, lastY, currentX, currentY, currentColor, currentWidth, currentTool);
-    emitStroke(lastX, lastY, currentX, currentY);
+    // THE FIX: Pass the 'Emit' coordinates to the network
+    emitStroke(lastEmitX, lastEmitY, currentX, currentY);
 
+    // 2. SYMMETRY DRAWING
     if (isSymmetryMode) {
         const mirrorLastX = canvas.width - lastX;
         const mirrorCurrentX = canvas.width - currentX;
         drawLine(mirrorLastX, lastY, mirrorCurrentX, currentY, currentColor, currentWidth, currentTool);
-        emitStroke(mirrorLastX, lastY, mirrorCurrentX, currentY); 
+        
+        // THE FIX: Calculate the mirrored 'Emit' coordinates for the network
+        const mirrorLastEmitX = canvas.width - lastEmitX;
+        emitStroke(mirrorLastEmitX, lastEmitY, mirrorCurrentX, currentY); 
     }
 
     lastX = currentX;
     lastY = currentY;
+    
+    // Reset the emit trackers here instead of in emitStroke
+    const now = Date.now();
+    if (now - lastEmitTime > 10) {
+        lastEmitTime = now;
+        lastEmitX = currentX;
+        lastEmitY = currentY;
+    }
 });
 
 canvas.addEventListener('mouseup', () => isDrawing = false);
@@ -320,4 +356,35 @@ socket.on('cursor-disconnect', (id) => {
         remoteCursors[id].remove();
         delete remoteCursors[id];
     }
+});
+
+// CATCH UP THE CANVAS HISTORY
+socket.on('canvas-history', (historyArray) => {
+    // Loop through every stroke the Leader saved and draw it instantly
+    historyArray.forEach(stroke => {
+        drawLine(
+            stroke.startX, 
+            stroke.startY, 
+            stroke.endX, 
+            stroke.endY, 
+            stroke.color, 
+            stroke.thickness, 
+            stroke.tool
+        );
+    });
+});
+
+// Download board
+document.getElementById('downloadBtn').addEventListener('click', () => {
+    const canvas = document.getElementById('drawingCanvas');
+    const link = document.createElement('a');
+    link.download = `whiteboard-${myRoomId}.png`;
+    // Converts the canvas into a raw image file URL
+    link.href = canvas.toDataURL('image/png'); 
+    link.click();
+});
+
+// The Undo Feature
+document.getElementById('undoBtn').addEventListener('click', () => {
+    socket.emit('undo-stroke');
 });
