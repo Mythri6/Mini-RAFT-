@@ -25,14 +25,14 @@ let isSearchingForLeader = false;
 // --- RAFT WEBHOOK ---
 // The Leader will call this endpoint ONLY after a stroke is successfully 
 // committed to a majority of the replica logs.
-app.post('/broadcast', (req, res) => {
+/*app.post('/broadcast', (req, res) => {
     const committedStroke = req.body;
     
     // NOW the Gateway officially tells all connected browsers to draw it
     io.emit('remote-stroke', committedStroke);
     
     res.status(200).send("Broadcast successful");
-});
+});*/
 
 // Keep track of which rooms actually exist
 const activeRooms = new Set();

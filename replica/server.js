@@ -11,8 +11,7 @@ const PORT = process.env.PORT || 8081;
 let state = REPLICA_ID == 1 ? 'LEADER' : 'FOLLOWER'; 
 let currentTerm = 0;
 
-// --- YOUR VARIABLES (Role 3) ---
-// UPGRADE: Changed from single arrays to Dictionaries to track multiple rooms!
+// Uses Dictionaries to track multiple rooms
 let roomLogs = {}; 
 let roomCommitIndices = {};
 
@@ -23,7 +22,7 @@ const followers = [
     'http://replica3:8083'
 ].filter(url => !url.includes(PORT)); // Remove myself from the list
 
-// --- ENDPOINT 1: Catch data from Gateway (Leader Only) ---
+// ENDPOINT 1: Catch data from Gateway (Leader Only)
 app.post('/client-stroke', async (req, res) => {
     if (state !== 'LEADER') {
         return res.status(400).json({ success: false, message: "I am not the leader." });
@@ -32,7 +31,7 @@ app.post('/client-stroke', async (req, res) => {
     const newStroke = req.body;
     const roomId = newStroke.roomId;
 
-    // If this room doesn't exist in our memory yet, create it!
+    // If this room doesn't exist in memory yet, create it
     if (!roomLogs[roomId]) {
         roomLogs[roomId] = [];
         roomCommitIndices[roomId] = 0;
@@ -107,9 +106,9 @@ app.post('/client-stroke', async (req, res) => {
         console.log(`[Replica ${REPLICA_ID}] MAJORITY REACHED. Stroke committed at index ${roomCommitIndices[roomId]}.`);
         
         // Broadcast back to Gateway so the rest of the room sees it
-        try {
+        /* try {
             await axios.post('http://gateway:3000/broadcast', newStroke);
-        } catch (e) {}
+        } catch (e) {} */
 
         res.json({ success: true, message: "Stroke committed to cluster" });
     } else {
@@ -119,7 +118,7 @@ app.post('/client-stroke', async (req, res) => {
     }
 });
 
-// --- ENDPOINT 2: Followers receive data from Leader ---
+// ENDPOINT 2: Followers receive data from Leader
 app.post('/append-entries', (req, res) => {
     const { term, roomId, prevLogIndex, entries, leaderCommitIndex } = req.body;
 
@@ -128,7 +127,7 @@ app.post('/append-entries', (req, res) => {
         return res.json({ success: false });
     }
 
-    // If this room doesn't exist in our memory yet, create it!
+    // If this room doesn't exist in memory yet, create it
     if (!roomLogs[roomId]) {
         roomLogs[roomId] = [];
         roomCommitIndices[roomId] = 0;
@@ -145,9 +144,12 @@ app.post('/append-entries', (req, res) => {
         }); 
     }
 
-    // Safely append the strokes
+    // Safely apply the strokes to the EXACT index (Fixes concurrent network races)
     if (entries && entries.length > 0) {
+        // RAFT Rule: Slice off any conflicting future logs, then append the Leader's truth
+        roomLogs[roomId].splice(prevLogIndex + 1); 
         roomLogs[roomId].push(...entries);
+        
         console.log(`[Replica ${REPLICA_ID}] Follower saved stroke! Log size: ${roomLogs[roomId].length}`);
     }
 
@@ -159,7 +161,7 @@ app.post('/append-entries', (req, res) => {
     res.json({ success: true });
 });
 
-// --- UPGRADE: Delete the room from memory to save RAM ---
+// Delete the room from memory to save RAM
 app.delete('/room/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     delete roomLogs[roomId];
@@ -168,15 +170,15 @@ app.delete('/room/:roomId', (req, res) => {
     res.json({ success: true });
 });
 
-// --- ENDPOINT 3: For Member 1's "Latecomer" Bug ---
+// ENDPOINT 3: For the "Latecomer" Bug
 // Sends the entire canvas history when someone new joins
-// UPGRADE: Now it requires the room ID!
+// Requires Room ID
 app.get('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     res.json({ log: roomLogs[roomId] || [] });
 });
 
-// Wipe Canvas History (Ghost Board Fix) ---
+// Wipe Canvas History
 app.delete('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     if (roomLogs[roomId]) {
@@ -186,7 +188,7 @@ app.delete('/canvas/:roomId', (req, res) => {
     res.json({ success: true });
 });
 
-// The Undo Feature
+// The True Undo Feature (With Cluster Sync)
 app.delete('/undo/:roomId/:userName', (req, res) => {
     const { roomId, userName } = req.params;
     if (!roomLogs[roomId] || roomLogs[roomId].length === 0) {
@@ -204,8 +206,16 @@ app.delete('/undo/:roomId/:userName', (req, res) => {
 
     if (!targetStrokeId) return res.json({ success: false });
 
-    // 2. Filter out ALL segments that belong to that batch!
+    // 2. Filter out ALL segments that belong to that batch locally!
     roomLogs[roomId] = roomLogs[roomId].filter(stroke => stroke.strokeId !== targetStrokeId);
+
+    // 3. THE FIX: If I am the Leader, tell the Followers to delete it too
+    if (state === 'LEADER') {
+        followers.forEach(followerUrl => {
+            // Fire a quick message to the followers so they wipe it from their RAM
+            axios.delete(`${followerUrl}/undo/${roomId}/${userName}`).catch(() => {});
+        });
+    }
     
     console.log(`[Replica ${REPLICA_ID}] Undid full stroke batch for ${userName}`);
     res.json({ success: true });
