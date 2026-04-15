@@ -264,7 +264,13 @@ app.post('/client-stroke', async (req, res) => {
         res.json({ success: true, message: "Stroke committed to cluster" });
     } else {
         console.log(`[Replica ${REPLICA_ID}] MAJORITY FAILED. Stroke discarded.`);
-        roomLogs[roomId].pop(); // Remove it from our log because the cluster rejected it
+        
+        // Find the exact failed object in memory and cleanly extract it
+        const failedIndex = roomLogs[roomId].indexOf(newStroke);
+        if (failedIndex > -1) {
+            roomLogs[roomId].splice(failedIndex, 1); 
+        }
+        
         res.status(500).json({ success: false, message: "Cluster failed to reach consensus" });
     }
 });
@@ -384,6 +390,7 @@ app.delete('/room/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     delete roomLogs[roomId];
     delete roomCommitIndices[roomId];
+    persistState(); // THE FIX
     console.log(`[Replica ${REPLICA_ID}] Room ${roomId} deleted from memory.`);
     res.json({ success: true });
 });
@@ -400,7 +407,8 @@ app.get('/canvas/:roomId', (req, res) => {
 app.delete('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     if (roomLogs[roomId]) {
-        roomLogs[roomId] = []; // Empty the array, but keep the room alive!
+        roomLogs[roomId] = []; 
+        persistState(); // THE FIX
         console.log(`[Replica ${REPLICA_ID}] Cleared history for room ${roomId}`);
     }
     res.json({ success: true });
@@ -426,6 +434,7 @@ app.delete('/undo/:roomId/:userName', (req, res) => {
 
     // 2. Filter out ALL segments that belong to that batch locally!
     roomLogs[roomId] = roomLogs[roomId].filter(stroke => stroke.strokeId !== targetStrokeId);
+    persistState();
 
     // 3. THE FIX: If I am the Leader, tell the Followers to delete it too
     if (state === 'LEADER') {

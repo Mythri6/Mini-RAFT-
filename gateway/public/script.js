@@ -10,6 +10,11 @@ let lastEmitX = 0; // Track the X coordinate of the last network emit
 let lastEmitY = 0; // Track the Y coordinate of the last network emit
 let currentStrokeBatchId = null; // Groups a full mouse-drag together
 
+// --- REDO STATE TRACKERS ---
+let localStrokeBatches = []; 
+let redoStack = [];
+let currentBatch = [];
+
 const loginScreen = document.getElementById('loginScreen');
 const boardContainer = document.getElementById('boardContainer');
 const displayRoomId = document.getElementById('displayRoomId');
@@ -251,9 +256,9 @@ function drawLine(startX, startY, endX, endY, color, thickness, tool) {
 function emitStroke(startX, startY, endX, endY) {
     const now = Date.now();
     
-    if (now - lastEmitTime > 10) {
+    if (now - lastEmitTime > 30) {
         const strokeData = {
-            strokeId: currentStrokeBatchId, // USE THE BATCH ID
+            strokeId: currentStrokeBatchId,
             roomId: myRoomId,
             userName: myUserName,
             startX: startX, 
@@ -265,6 +270,9 @@ function emitStroke(startX, startY, endX, endY) {
             tool: currentTool 
         };
         
+        // Record the stroke locally before emitting
+        currentBatch.push(strokeData);
+        
         socket.emit('draw-stroke', strokeData);
     }
 }
@@ -274,10 +282,13 @@ canvas.addEventListener('mousedown', (e) => {
     lastX = e.offsetX;
     lastY = e.offsetY;
 
-    // Start a new batch and log the starting point for the network
     currentStrokeBatchId = generateUUID(); 
     lastEmitX = lastX;
     lastEmitY = lastY;
+    
+    // Reset the trackers for a new drawing
+    currentBatch = [];
+    redoStack = []; // Drawing something new invalidates the redo future
 });
 
 canvas.addEventListener('mousemove', (e) => {
@@ -319,8 +330,16 @@ canvas.addEventListener('mousemove', (e) => {
     }
 });
 
-canvas.addEventListener('mouseup', () => isDrawing = false);
-canvas.addEventListener('mouseout', () => isDrawing = false);
+// Save the batch when the user lifts their mouse
+const stopDrawing = () => {
+    if (isDrawing && currentBatch.length > 0) {
+        localStrokeBatches.push([...currentBatch]);
+    }
+    isDrawing = false;
+};
+
+canvas.addEventListener('mouseup', stopDrawing);
+canvas.addEventListener('mouseout', stopDrawing);
 
 // --- SERVER EVENTS ---
 socket.on('remote-stroke', (data) => {
@@ -386,5 +405,37 @@ document.getElementById('downloadBtn').addEventListener('click', () => {
 
 // The Undo Feature
 document.getElementById('undoBtn').addEventListener('click', () => {
+    if (localStrokeBatches.length > 0) {
+        // Move the last drawing batch from our history into the redo stack
+        redoStack.push(localStrokeBatches.pop());
+    }
     socket.emit('undo-stroke');
+});
+
+document.getElementById('redoBtn').addEventListener('click', () => {
+    if (redoStack.length > 0) {
+        // Pull the last undone batch out of the stack
+        const batchToRedo = redoStack.pop();
+        const newBatchId = generateUUID(); // Give it a new ID so it can be undone again
+        const newBatch = [];
+
+        // Rapidly fire the old strokes back into the cluster
+        batchToRedo.forEach(stroke => {
+            const redoStroke = { ...stroke, strokeId: newBatchId };
+            newBatch.push(redoStroke);
+            
+            // 1. Draw it locally immediately
+            drawLine(
+                redoStroke.startX, redoStroke.startY, 
+                redoStroke.endX, redoStroke.endY, 
+                redoStroke.color, redoStroke.thickness, redoStroke.tool
+            );
+            
+            // 2. Send it to the RAFT cluster to save and broadcast
+            socket.emit('draw-stroke', redoStroke);
+        });
+
+        // Save this new batch into our history so we can undo it again later
+        localStrokeBatches.push(newBatch);
+    }
 });

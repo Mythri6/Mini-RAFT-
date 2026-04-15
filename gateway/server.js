@@ -82,8 +82,17 @@ async function requestViaLeader(requestFn) {
     }
 }
 
-setInterval(() => {
-    void findLeader();
+// A dedicated background loop to manage the UI state seamlessly
+setInterval(async () => {
+    const oldLeader = currentLeader;
+    await findLeader();
+    
+    // If the cluster heals and finds a new leader, broadcast the green badge to all users!
+    if (currentLeader && currentLeader !== oldLeader) {
+        io.emit('leader-status', { status: 'healthy', msg: `Connected to Leader (${currentLeader})` });
+    } else if (!currentLeader) {
+        io.emit('leader-status', { status: 'chaotic', msg: 'LEADER DOWN! Re-electing...' });
+    }
 }, 2000);
 
 void findLeader(true);
@@ -174,16 +183,17 @@ io.on('connection', (socket) => {
     }
 
     socket.on('cursor-move', (data) => { if (socket.roomId) socket.to(socket.roomId).emit('cursor-move', data); });
-    socket.on('draw-stroke', async (strokeData) => {
+    // Removed the 'async' keyword here
+    socket.on('draw-stroke', (strokeData) => {
         if (socket.roomId) socket.to(socket.roomId).emit('remote-stroke', strokeData); 
-        try {
-            await requestViaLeader((leader) =>
-                axios.post(`${leader}/client-stroke`, strokeData, { timeout: 1000 })
-            );
-            socket.emit('leader-status', { status: 'healthy', msg: `Connected to Leader (${currentLeader})` });
-        } catch (error) {
-            socket.emit('leader-status', { status: 'chaotic', msg: '⚠️ LEADER DOWN! Re-electing...' });
-        }
+        
+        // "Fire and Forget". Send it to the RAFT cluster in the 
+        // background, but do NOT halt the WebSocket thread to wait for it.
+        requestViaLeader((leader) =>
+            axios.post(`${leader}/client-stroke`, strokeData, { timeout: 2000 })
+        ).catch(() => {
+            // Silently ignore drops. Our background health-checker will handle UI warnings.
+        });
     });
     // Tell the Leader to forget the drawings
     socket.on('clear-canvas', async () => { 
