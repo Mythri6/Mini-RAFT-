@@ -11,7 +11,7 @@ const io = new Server(server);
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-let currentLeader = 'http://replica1:8081';
+let currentLeader = null;
 // The hardcoded addresses of your 3 RAFT containers
 const clusterNodes = [
     'http://replica1:8081',
@@ -21,6 +21,72 @@ const clusterNodes = [
 
 // We need a lock to prevent spamming the cluster with election checks
 let isSearchingForLeader = false;
+let leaderSearchPromise = null;
+
+async function findLeader(force = false) {
+    if (isSearchingForLeader && leaderSearchPromise) {
+        return leaderSearchPromise;
+    }
+
+    leaderSearchPromise = (async () => {
+        if (!force && currentLeader) {
+            try {
+                const check = await axios.get(`${currentLeader}/status`, { timeout: 500 });
+                if (check.data && check.data.state === 'LEADER') {
+                    return currentLeader;
+                }
+            } catch {
+                // Fall through to full cluster scan.
+            }
+        }
+
+        for (const node of clusterNodes) {
+            try {
+                const response = await axios.get(`${node}/status`, { timeout: 500 });
+                if (response.data && response.data.state === 'LEADER') {
+                    currentLeader = node;
+                    return currentLeader;
+                }
+            } catch {
+                // Node may be down.
+            }
+        }
+
+        currentLeader = null;
+        return null;
+    })();
+
+    isSearchingForLeader = true;
+    try {
+        return await leaderSearchPromise;
+    } finally {
+        isSearchingForLeader = false;
+        leaderSearchPromise = null;
+    }
+}
+
+async function requestViaLeader(requestFn) {
+    let leader = currentLeader || await findLeader();
+    if (!leader) {
+        throw new Error('No active leader found');
+    }
+
+    try {
+        return await requestFn(leader);
+    } catch {
+        leader = await findLeader(true);
+        if (!leader) {
+            throw new Error('No active leader found after retry');
+        }
+        return requestFn(leader);
+    }
+}
+
+setInterval(() => {
+    void findLeader();
+}, 2000);
+
+void findLeader(true);
 
 // --- RAFT WEBHOOK ---
 // The Leader will call this endpoint ONLY after a stroke is successfully 
@@ -63,9 +129,10 @@ io.on('connection', (socket) => {
         socket.userName = userName;
         
         try {
-            // Tell the leader we only want the history for THIS room
-            const response = await axios.get(`${currentLeader}/canvas/${roomId}`);
-            socket.emit('canvas-history', response.data.log);
+            const response = await requestViaLeader((leader) =>
+                axios.get(`${leader}/canvas/${roomId}`, { timeout: 1000 })
+            );
+            socket.emit('canvas-history', response.data.log || []);
         } catch (error) {}
 
         await broadcastUserList(roomId);
@@ -98,7 +165,11 @@ io.on('connection', (socket) => {
             console.log(`Room ${roomId} is empty. Deleting...`);
             activeRooms.delete(roomId);
             // Tell the RAFT cluster to wipe it from memory
-            try { await axios.delete(`${currentLeader}/room/${roomId}`); } catch(e){}
+            try {
+                await requestViaLeader((leader) =>
+                    axios.delete(`${leader}/room/${roomId}`, { timeout: 1000 })
+                );
+            } catch(e){}
         }
     }
 
@@ -106,7 +177,9 @@ io.on('connection', (socket) => {
     socket.on('draw-stroke', async (strokeData) => {
         if (socket.roomId) socket.to(socket.roomId).emit('remote-stroke', strokeData); 
         try {
-            await axios.post(`${currentLeader}/client-stroke`, strokeData);
+            await requestViaLeader((leader) =>
+                axios.post(`${leader}/client-stroke`, strokeData, { timeout: 1000 })
+            );
             socket.emit('leader-status', { status: 'healthy', msg: `Connected to Leader (${currentLeader})` });
         } catch (error) {
             socket.emit('leader-status', { status: 'chaotic', msg: '⚠️ LEADER DOWN! Re-electing...' });
@@ -119,7 +192,9 @@ io.on('connection', (socket) => {
             
             try { 
                 // Hit your brand new Replica endpoint
-                await axios.delete(`${currentLeader}/canvas/${socket.roomId}`); 
+                await requestViaLeader((leader) =>
+                    axios.delete(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
+                );
             } catch(error) {}
         }
     });
@@ -129,10 +204,14 @@ io.on('connection', (socket) => {
 
         try {
             // Tell the Leader to delete the stroke from memory
-            await axios.delete(`${currentLeader}/undo/${socket.roomId}/${socket.userName}`);
+            await requestViaLeader((leader) =>
+                axios.delete(`${leader}/undo/${socket.roomId}/${socket.userName}`, { timeout: 1000 })
+            );
             
             // Ask the Leader for the newly updated, fixed array
-            const response = await axios.get(`${currentLeader}/canvas/${socket.roomId}`);
+            const response = await requestViaLeader((leader) =>
+                axios.get(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
+            );
             
             // Tell EVERYONE in the room to clear their board and redraw the fixed history!
             io.to(socket.roomId).emit('clear-canvas');

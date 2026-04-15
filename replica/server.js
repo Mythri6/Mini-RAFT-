@@ -6,23 +6,171 @@ app.use(express.json());
 const storage = require('./storage');
 const REPLICA_ID = process.env.REPLICA_ID || 1;
 const PORT = process.env.PORT || 8081;
+const NODE_ID = `replica-${REPLICA_ID}`;
+
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '150', 10);
+const ELECTION_TIMEOUT_MIN_MS = parseInt(process.env.ELECTION_TIMEOUT_MIN_MS || '500', 10);
+const ELECTION_TIMEOUT_MAX_MS = parseInt(process.env.ELECTION_TIMEOUT_MAX_MS || '800', 10);
+
+const clusterNodes = [
+    'http://replica1:8081',
+    'http://replica2:8082',
+    'http://replica3:8083'
+];
 
 // --- RAFT STATE ---
-// For now, we force Replica 1 to act as the Leader
+// All nodes start as followers and participate in election.
 const persisted = storage.loadData();
-let state = REPLICA_ID == 1 ? 'LEADER' : 'FOLLOWER'; 
+let state = 'FOLLOWER';
 let currentTerm = persisted.currentTerm || 0;
+let votedFor = persisted.votedFor || null;
 
 // Uses Dictionaries to track multiple rooms
 let roomLogs = persisted.log || {};
 let roomCommitIndices = {};
 
+let electionTimer = null;
+let heartbeatTimer = null;
+
 // The addresses of the other nodes so the Leader knows who to send data to
-const followers = [
-    'http://replica1:8081',
-    'http://replica2:8082',
-    'http://replica3:8083'
-].filter(url => !url.includes(PORT)); // Remove myself from the list
+const followers = clusterNodes.filter(url => !url.endsWith(`:${PORT}`));
+
+function persistState() {
+    storage.saveState(currentTerm, roomLogs, votedFor);
+}
+
+function randomElectionTimeoutMs() {
+    const min = Math.min(ELECTION_TIMEOUT_MIN_MS, ELECTION_TIMEOUT_MAX_MS);
+    const max = Math.max(ELECTION_TIMEOUT_MIN_MS, ELECTION_TIMEOUT_MAX_MS);
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function stopHeartbeatLoop() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
+}
+
+function resetElectionTimer() {
+    if (electionTimer) {
+        clearTimeout(electionTimer);
+        electionTimer = null;
+    }
+
+    if (state === 'LEADER') {
+        return;
+    }
+
+    electionTimer = setTimeout(() => {
+        startElection().catch((error) => {
+            console.log(`[Replica ${REPLICA_ID}] Election error: ${error.message}`);
+            resetElectionTimer();
+        });
+    }, randomElectionTimeoutMs());
+}
+
+function stepDown(nextTerm) {
+    if (nextTerm > currentTerm) {
+        currentTerm = nextTerm;
+        votedFor = null;
+        persistState();
+    }
+
+    if (state !== 'FOLLOWER') {
+        state = 'FOLLOWER';
+        stopHeartbeatLoop();
+    }
+
+    resetElectionTimer();
+}
+
+async function sendHeartbeats() {
+    if (state !== 'LEADER') {
+        return;
+    }
+
+    const payload = {
+        term: currentTerm,
+        leaderId: NODE_ID
+    };
+
+    await Promise.all(followers.map(async (followerUrl) => {
+        try {
+            const response = await axios.post(`${followerUrl}/heartbeat`, payload, { timeout: 500 });
+            if (response.data && response.data.term > currentTerm) {
+                stepDown(response.data.term);
+            }
+        } catch {
+            // Follower may be down; election will happen only if majority cannot sustain leadership.
+        }
+    }));
+}
+
+function startHeartbeatLoop() {
+    stopHeartbeatLoop();
+    void sendHeartbeats();
+    heartbeatTimer = setInterval(() => {
+        void sendHeartbeats();
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+async function startElection() {
+    if (state === 'LEADER') {
+        return;
+    }
+
+    state = 'CANDIDATE';
+    currentTerm += 1;
+    votedFor = NODE_ID;
+    persistState();
+
+    let votes = 1;
+    const termAtStart = currentTerm;
+    const majority = Math.floor(clusterNodes.length / 2) + 1;
+
+    await Promise.all(followers.map(async (followerUrl) => {
+        try {
+            const response = await axios.post(`${followerUrl}/request-vote`, {
+                term: termAtStart,
+                candidateId: NODE_ID
+            }, { timeout: 500 });
+
+            const data = response.data || {};
+            if (data.term > currentTerm) {
+                stepDown(data.term);
+                return;
+            }
+
+            if (state === 'CANDIDATE' && currentTerm === termAtStart && data.voteGranted) {
+                votes += 1;
+            }
+        } catch {
+            // Ignore unreachable followers during election.
+        }
+    }));
+
+    if (state !== 'CANDIDATE' || currentTerm !== termAtStart) {
+        if (state !== 'LEADER') {
+            resetElectionTimer();
+        }
+        return;
+    }
+
+    if (votes >= majority) {
+        state = 'LEADER';
+        if (electionTimer) {
+            clearTimeout(electionTimer);
+            electionTimer = null;
+        }
+        console.log(`[Replica ${REPLICA_ID}] Became LEADER for term ${currentTerm}`);
+        startHeartbeatLoop();
+        return;
+    }
+
+    state = 'FOLLOWER';
+    resetElectionTimer();
+}
 
 // ENDPOINT 1: Catch data from Gateway (Leader Only)
 app.post('/client-stroke', async (req, res) => {
@@ -45,7 +193,7 @@ app.post('/client-stroke', async (req, res) => {
     }
 
     roomLogs[roomId].push(newStroke);
-    storage.saveState(currentTerm, roomLogs);
+    persistState();
     const prevLogIndex = roomLogs[roomId].length - 2;
 
     console.log(`[Replica ${REPLICA_ID}] Leader received stroke. Log size for ${roomId}: ${roomLogs[roomId].length}`);
@@ -127,8 +275,21 @@ app.post('/append-entries', (req, res) => {
 
     // Reject if the leader's term is outdated
     if (term < currentTerm) {
-        return res.json({ success: false });
+        return res.json({ success: false, term: currentTerm });
     }
+
+    if (term > currentTerm) {
+        currentTerm = term;
+        votedFor = null;
+        persistState();
+    }
+
+    if (state !== 'FOLLOWER') {
+        state = 'FOLLOWER';
+        stopHeartbeatLoop();
+    }
+
+    resetElectionTimer();
 
     // If this room doesn't exist in memory yet, create it
     if (!roomLogs[roomId]) {
@@ -152,7 +313,7 @@ app.post('/append-entries', (req, res) => {
         // RAFT Rule: Slice off any conflicting future logs, then append the Leader's truth
         roomLogs[roomId].splice(prevLogIndex + 1); 
         roomLogs[roomId].push(...entries);
-        storage.saveState(currentTerm, roomLogs);
+        persistState();
         console.log(`[Replica ${REPLICA_ID}] Follower saved stroke! Log size: ${roomLogs[roomId].length}`);
     }
 
@@ -162,6 +323,60 @@ app.post('/append-entries', (req, res) => {
     }
 
     res.json({ success: true });
+});
+
+app.post('/heartbeat', (req, res) => {
+    const { term } = req.body;
+
+    if (term < currentTerm) {
+        return res.json({ success: false, term: currentTerm });
+    }
+
+    if (term > currentTerm) {
+        currentTerm = term;
+        votedFor = null;
+        persistState();
+    }
+
+    if (state !== 'FOLLOWER') {
+        state = 'FOLLOWER';
+        stopHeartbeatLoop();
+    }
+
+    resetElectionTimer();
+    res.json({ success: true, term: currentTerm });
+});
+
+app.post('/request-vote', (req, res) => {
+    const { term, candidateId } = req.body;
+
+    if (typeof term !== 'number' || !candidateId) {
+        return res.status(400).json({ voteGranted: false, term: currentTerm });
+    }
+
+    if (term < currentTerm) {
+        return res.json({ voteGranted: false, term: currentTerm });
+    }
+
+    if (term > currentTerm) {
+        currentTerm = term;
+        votedFor = null;
+        if (state !== 'FOLLOWER') {
+            state = 'FOLLOWER';
+            stopHeartbeatLoop();
+        }
+        persistState();
+    }
+
+        if (votedFor !== null && votedFor !== candidateId) {
+            resetElectionTimer();
+        return res.json({ voteGranted: false, term: currentTerm });
+    }
+
+    votedFor = candidateId;
+    persistState();
+    resetElectionTimer();
+    res.json({ voteGranted: true, term: currentTerm });
 });
 
 // Delete the room from memory to save RAM
@@ -231,6 +446,7 @@ app.get('/status', (req, res) => {
         replicaId: REPLICA_ID,
         state,
         currentTerm,
+        votedFor,
         activeRooms: Object.keys(roomLogs).length,
         totalLogs: Object.values(roomLogs).reduce((acc, logs) => acc + logs.length, 0)
     });
@@ -238,4 +454,5 @@ app.get('/status', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Replica ${REPLICA_ID} running on port ${PORT} as ${state}`);
+    resetElectionTimer();
 });
