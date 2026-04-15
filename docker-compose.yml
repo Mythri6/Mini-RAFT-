@@ -5,9 +5,10 @@ services:
     working_dir: /app
     volumes:
       - ./gateway:/app  # Bind mount for hot-reload
+      - /app/node_modules
     ports:
       - "3000:3000"
-    command: sh -c "npm run dev"
+    command: sh -c "npm install && npm run dev"
     networks:
       - raft_network
 

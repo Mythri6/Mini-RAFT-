@@ -3,16 +3,18 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
+const storage = require('./storage');
 const REPLICA_ID = process.env.REPLICA_ID || 1;
 const PORT = process.env.PORT || 8081;
 
 // --- RAFT STATE ---
 // For now, we force Replica 1 to act as the Leader
+const persisted = storage.loadData();
 let state = REPLICA_ID == 1 ? 'LEADER' : 'FOLLOWER'; 
-let currentTerm = 0;
+let currentTerm = persisted.currentTerm || 0;
 
 // Uses Dictionaries to track multiple rooms
-let roomLogs = {}; 
+let roomLogs = persisted.log || {};
 let roomCommitIndices = {};
 
 // The addresses of the other nodes so the Leader knows who to send data to
@@ -43,6 +45,7 @@ app.post('/client-stroke', async (req, res) => {
     }
 
     roomLogs[roomId].push(newStroke);
+    storage.saveState(currentTerm, roomLogs);
     const prevLogIndex = roomLogs[roomId].length - 2;
 
     console.log(`[Replica ${REPLICA_ID}] Leader received stroke. Log size for ${roomId}: ${roomLogs[roomId].length}`);
@@ -149,7 +152,7 @@ app.post('/append-entries', (req, res) => {
         // RAFT Rule: Slice off any conflicting future logs, then append the Leader's truth
         roomLogs[roomId].splice(prevLogIndex + 1); 
         roomLogs[roomId].push(...entries);
-        
+        storage.saveState(currentTerm, roomLogs);
         console.log(`[Replica ${REPLICA_ID}] Follower saved stroke! Log size: ${roomLogs[roomId].length}`);
     }
 
@@ -224,7 +227,13 @@ app.delete('/undo/:roomId/:userName', (req, res) => {
 // --- ROLE 4: STATUS API ---
 app.get('/status', (req, res) => {
     // Upgraded to show the number of active rooms instead of array length
-    res.json({ state, currentTerm, activeRooms: Object.keys(roomLogs).length });
+    res.json({
+        replicaId: REPLICA_ID,
+        state,
+        currentTerm,
+        activeRooms: Object.keys(roomLogs).length,
+        totalLogs: Object.values(roomLogs).reduce((acc, logs) => acc + logs.length, 0)
+    });
 });
 
 app.listen(PORT, () => {
