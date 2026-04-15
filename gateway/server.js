@@ -121,31 +121,39 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('room-users-update', users);
     };
 
-    // --- UPGRADE: Tweak 2 (Create vs Join Bouncer) ---
-    socket.on('join-room', async (data, callback) => { // Notice the "callback" added here!
+    // --- UPGRADE: Tweak 2 (Create vs Join Bouncer with Database Fallback) ---
+    socket.on('join-room', async (data, callback) => { 
         const { roomId, userName, isCreating } = data;
 
-        if (!isCreating && !activeRooms.has(roomId)) {
-            // Reject! Room doesn't exist
+        let roomExistsInBackend = false;
+        let canvasHistory = [];
+
+        // 1. ALWAYS ask the Leader for the room data first
+        try {
+            const response = await requestViaLeader((leader) =>
+                axios.get(`${leader}/canvas/${roomId}`, { timeout: 1000 })
+            );
+            roomExistsInBackend = response.data.exists;
+            canvasHistory = response.data.log || [];
+        } catch (error) {}
+
+        // 2. The Check: If it's not a new room, AND the Gateway forgot it, AND the database forgot it -> Reject!
+        if (!isCreating && !activeRooms.has(roomId) && !roomExistsInBackend) {
             return callback({ success: false, message: "Room not found!" });
         }
 
-        // If creating, add it to our official list
-        if (isCreating) activeRooms.add(roomId);
+        // 3. If the database remembered the room but the Gateway forgot it (due to a crash), restore it to RAM!
+        activeRooms.add(roomId);
 
         socket.join(roomId);
         socket.roomId = roomId;
         socket.userName = userName;
         
-        try {
-            const response = await requestViaLeader((leader) =>
-                axios.get(`${leader}/canvas/${roomId}`, { timeout: 1000 })
-            );
-            socket.emit('canvas-history', response.data.log || []);
-        } catch (error) {}
+        // 4. Send the history we fetched in step 1 directly to the user
+        socket.emit('canvas-history', canvasHistory);
 
         await broadcastUserList(roomId);
-        callback({ success: true }); // Let the frontend know they got in safely
+        callback({ success: true }); 
     });
 
     // --- UPGRADE: Tweak 3 (Delete Room When Empty) ---
@@ -169,17 +177,23 @@ io.on('connection', (socket) => {
 
     // Helper to delete the room if the last person leaves
     async function checkAndCleanUpRoom(roomId) {
-        const room = io.sockets.adapter.rooms.get(roomId);
-        if (!room || room.size === 0) {
-            console.log(`Room ${roomId} is empty. Deleting...`);
-            activeRooms.delete(roomId);
-            // Tell the RAFT cluster to wipe it from memory
-            try {
-                await requestViaLeader((leader) =>
-                    axios.delete(`${leader}/room/${roomId}`, { timeout: 1000 })
-                );
-            } catch(e){}
-        }
+        // Wait 60 seconds to see if anyone comes back!
+        setTimeout(async () => {
+            const room = io.sockets.adapter.rooms.get(roomId);
+            
+            // Check if it's empty AND check if it hasn't already been deleted!
+            if ((!room || room.size === 0) && activeRooms.has(roomId)) {
+                
+                console.log(`Room ${roomId} has been empty for 60s. Deleting...`);
+                activeRooms.delete(roomId); // The first timer deletes it from RAM here
+                
+                try {
+                    await requestViaLeader((leader) =>
+                        axios.delete(`${leader}/room/${roomId}`, { timeout: 1000 })
+                    );
+                } catch(e){}
+            }
+        }, 60000); // 60,000 ms = 1 minute
     }
 
     socket.on('cursor-move', (data) => { if (socket.roomId) socket.to(socket.roomId).emit('cursor-move', data); });

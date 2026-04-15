@@ -323,7 +323,7 @@ canvas.addEventListener('mousemove', (e) => {
     
     // Reset the emit trackers here instead of in emitStroke
     const now = Date.now();
-    if (now - lastEmitTime > 10) {
+    if (now - lastEmitTime > 30) {
         lastEmitTime = now;
         lastEmitX = currentX;
         lastEmitY = currentY;
@@ -414,28 +414,35 @@ document.getElementById('undoBtn').addEventListener('click', () => {
 
 document.getElementById('redoBtn').addEventListener('click', () => {
     if (redoStack.length > 0) {
-        // Pull the last undone batch out of the stack
         const batchToRedo = redoStack.pop();
-        const newBatchId = generateUUID(); // Give it a new ID so it can be undone again
+        const newBatchId = generateUUID(); 
         const newBatch = [];
 
-        // Rapidly fire the old strokes back into the cluster
-        batchToRedo.forEach(stroke => {
+        // THE FIX: Use an interval to stream the strokes slowly instead of a DDoS blast!
+        let i = 0;
+        const redoInterval = setInterval(() => {
+            if (i >= batchToRedo.length) {
+                clearInterval(redoInterval);
+                // Save this new batch into our history after it finishes rendering
+                localStrokeBatches.push(newBatch);
+                return;
+            }
+
+            const stroke = batchToRedo[i];
             const redoStroke = { ...stroke, strokeId: newBatchId };
             newBatch.push(redoStroke);
             
-            // 1. Draw it locally immediately
+            // 1. Draw it locally
             drawLine(
                 redoStroke.startX, redoStroke.startY, 
                 redoStroke.endX, redoStroke.endY, 
                 redoStroke.color, redoStroke.thickness, redoStroke.tool
             );
             
-            // 2. Send it to the RAFT cluster to save and broadcast
+            // 2. Send it to the RAFT cluster
             socket.emit('draw-stroke', redoStroke);
-        });
-
-        // Save this new batch into our history so we can undo it again later
-        localStrokeBatches.push(newBatch);
+            
+            i++;
+        }, 10); // A 10ms gap gives the backend CPU time to breathe
     }
 });

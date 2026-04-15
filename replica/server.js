@@ -18,6 +18,9 @@ const clusterNodes = [
     'http://replica3:8083'
 ];
 
+// BONUS CHALLENGE: Network Partition Simulator
+let isNetworkPartitioned = false;
+
 // --- RAFT STATE ---
 // All nodes start as followers and participate in election.
 const persisted = storage.loadData();
@@ -213,7 +216,8 @@ app.post('/client-stroke', async (req, res) => {
     // 2. Broadcast to Followers and handle Catch-Up
     const syncPromises = followers.map(async (followerUrl) => {
         try {
-            const response = await axios.post(`${followerUrl}/append-entries`, payload);
+            // Add { timeout: 1000 }
+            const response = await axios.post(`${followerUrl}/append-entries`, payload, { timeout: 1000 });
             
             if (response.data.success) {
                 console.log(`[Replica ${REPLICA_ID}] Successfully synced stroke to ${followerUrl}`);
@@ -231,11 +235,11 @@ app.post('/client-stroke', async (req, res) => {
                     await axios.post(`${followerUrl}/append-entries`, {
                         term: currentTerm,
                         leaderId: `replica-${REPLICA_ID}`,
-                        roomId: roomId, // NEW: Include the room ID here too
+                        roomId: roomId, 
                         prevLogIndex: response.data.followerLogLength - 1,
                         entries: missingStrokes,
                         leaderCommitIndex: roomCommitIndices[roomId]
-                    });
+                    }, { timeout: 1000 }); // Add { timeout: 1000 } here too
                     
                     console.log(`[Replica ${REPLICA_ID}] Successfully caught up ${followerUrl}!`);
                     successCount++; // Now their vote counts!
@@ -269,6 +273,7 @@ app.post('/client-stroke', async (req, res) => {
         const failedIndex = roomLogs[roomId].indexOf(newStroke);
         if (failedIndex > -1) {
             roomLogs[roomId].splice(failedIndex, 1); 
+            persistState();
         }
         
         res.status(500).json({ success: false, message: "Cluster failed to reach consensus" });
@@ -277,6 +282,12 @@ app.post('/client-stroke', async (req, res) => {
 
 // ENDPOINT 2: Followers receive data from Leader
 app.post('/append-entries', (req, res) => {
+
+    if (isNetworkPartitioned) {
+        // Return a simulated network timeout error
+        return res.status(503).json({ error: "Network unreachable" }); 
+    }
+
     const { term, roomId, prevLogIndex, entries, leaderCommitIndex } = req.body;
 
     // Reject if the leader's term is outdated
@@ -332,6 +343,12 @@ app.post('/append-entries', (req, res) => {
 });
 
 app.post('/heartbeat', (req, res) => {
+
+    if (isNetworkPartitioned) {
+        // Return a simulated network timeout error
+        return res.status(503).json({ error: "Network unreachable" }); 
+    }
+
     const { term } = req.body;
 
     if (term < currentTerm) {
@@ -354,6 +371,12 @@ app.post('/heartbeat', (req, res) => {
 });
 
 app.post('/request-vote', (req, res) => {
+
+    if (isNetworkPartitioned) {
+        // Return a simulated network timeout error
+        return res.status(503).json({ error: "Network unreachable" }); 
+    }
+    
     const { term, candidateId } = req.body;
 
     if (typeof term !== 'number' || !candidateId) {
@@ -390,17 +413,27 @@ app.delete('/room/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     delete roomLogs[roomId];
     delete roomCommitIndices[roomId];
-    persistState(); // THE FIX
+    persistState(); 
+    
+    // THE FIX: Tell the followers to delete the room!
+    if (state === 'LEADER') {
+        followers.forEach(followerUrl => {
+            axios.delete(`${followerUrl}/room/${roomId}`).catch(() => {});
+        });
+    }
     console.log(`[Replica ${REPLICA_ID}] Room ${roomId} deleted from memory.`);
     res.json({ success: true });
 });
 
 // ENDPOINT 3: For the "Latecomer" Bug
 // Sends the entire canvas history when someone new joins
-// Requires Room ID
 app.get('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
-    res.json({ log: roomLogs[roomId] || [] });
+    // Explicitly tell the Gateway if this room exists in our database
+    res.json({ 
+        exists: roomLogs.hasOwnProperty(roomId), 
+        log: roomLogs[roomId] || [] 
+    });
 });
 
 // Wipe Canvas History
@@ -408,7 +441,14 @@ app.delete('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     if (roomLogs[roomId]) {
         roomLogs[roomId] = []; 
-        persistState(); // THE FIX
+        persistState(); 
+        
+        // Tell the followers to wipe it too
+        if (state === 'LEADER') {
+            followers.forEach(followerUrl => {
+                axios.delete(`${followerUrl}/canvas/${roomId}`).catch(() => {});
+            });
+        }
         console.log(`[Replica ${REPLICA_ID}] Cleared history for room ${roomId}`);
     }
     res.json({ success: true });
@@ -459,6 +499,12 @@ app.get('/status', (req, res) => {
         activeRooms: Object.keys(roomLogs).length,
         totalLogs: Object.values(roomLogs).reduce((acc, logs) => acc + logs.length, 0)
     });
+});
+
+app.post('/toggle-partition', (req, res) => {
+    isNetworkPartitioned = !isNetworkPartitioned;
+    console.log(`[Replica ${REPLICA_ID}] Network Partition: ${isNetworkPartitioned ? 'ACTIVE (Cut off)' : 'RESOLVED (Reconnected)'}`);
+    res.json({ partitioned: isNetworkPartitioned });
 });
 
 app.listen(PORT, () => {
