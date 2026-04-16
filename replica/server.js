@@ -74,13 +74,17 @@ function resetElectionTimer() {
 }
 
 function stepDown(nextTerm) {
+    console.log(`\n[Replica ${REPLICA_ID}] 📉 STEPPING DOWN. My term: ${currentTerm}, Incoming term: ${nextTerm}`);
+    
     if (nextTerm > currentTerm) {
+        console.log(`[Replica ${REPLICA_ID}] 🔄 Term updated to ${nextTerm}. Clearing votedFor.`);
         currentTerm = nextTerm;
         votedFor = null;
         persistState();
     }
 
     if (state !== 'FOLLOWER') {
+        console.log(`[Replica ${REPLICA_ID}] 🛑 State changed from ${state} to FOLLOWER. Stopping heartbeats.`);
         state = 'FOLLOWER';
         stopHeartbeatLoop();
     }
@@ -119,46 +123,55 @@ function startHeartbeatLoop() {
 }
 
 async function startElection() {
-    if (state === 'LEADER') {
-        return;
-    }
+    if (state === 'LEADER') return;
 
     state = 'CANDIDATE';
     currentTerm += 1;
     votedFor = NODE_ID;
     persistState();
 
-    let votes = 1;
+    console.log(`\n=========================================`);
+    console.log(`[Replica ${REPLICA_ID}] 🚀 STARTING ELECTION FOR TERM ${currentTerm}`);
+    console.log(`=========================================`);
+
+    let votes = 1; // Votes for self
     const termAtStart = currentTerm;
     const majority = Math.floor(clusterNodes.length / 2) + 1;
 
     await Promise.all(followers.map(async (followerUrl) => {
         try {
+            console.log(`[Replica ${REPLICA_ID}] 📨 Asking ${followerUrl} for a vote...`);
             const response = await axios.post(`${followerUrl}/request-vote`, {
                 term: termAtStart,
                 candidateId: NODE_ID
             }, { timeout: 500 });
 
             const data = response.data || {};
+            
             if (data.term > currentTerm) {
+                console.log(`[Replica ${REPLICA_ID}] ❌ ${followerUrl} has a higher term (${data.term}). Aborting election.`);
                 stepDown(data.term);
                 return;
             }
 
             if (state === 'CANDIDATE' && currentTerm === termAtStart && data.voteGranted) {
+                console.log(`[Replica ${REPLICA_ID}] ✅ Vote GRANTED by ${followerUrl}!`);
                 votes += 1;
+            } else {
+                console.log(`[Replica ${REPLICA_ID}] 🚫 Vote DENIED by ${followerUrl}.`);
             }
-        } catch {
-            // Ignore unreachable followers during election.
+        } catch (e) {
+            console.log(`[Replica ${REPLICA_ID}] ⚠️ Cannot reach ${followerUrl} for election.`);
         }
     }));
 
     if (state !== 'CANDIDATE' || currentTerm !== termAtStart) {
-        if (state !== 'LEADER') {
-            resetElectionTimer();
-        }
+        console.log(`[Replica ${REPLICA_ID}] 🛑 Election interrupted. No longer candidate for term ${termAtStart}.`);
+        if (state !== 'LEADER') resetElectionTimer();
         return;
     }
+
+    console.log(`[Replica ${REPLICA_ID}] 📊 ELECTION TALLY: ${votes}/${clusterNodes.length} votes.`);
 
     if (votes >= majority) {
         state = 'LEADER';
@@ -166,11 +179,12 @@ async function startElection() {
             clearTimeout(electionTimer);
             electionTimer = null;
         }
-        console.log(`[Replica ${REPLICA_ID}] Became LEADER for term ${currentTerm}`);
+        console.log(`\n👑 [Replica ${REPLICA_ID}] BECAME LEADER FOR TERM ${currentTerm} 👑\n`);
         startHeartbeatLoop();
         return;
     }
 
+    console.log(`[Replica ${REPLICA_ID}] ❌ Failed to secure majority. Returning to FOLLOWER.`);
     state = 'FOLLOWER';
     resetElectionTimer();
 }
@@ -371,23 +385,25 @@ app.post('/heartbeat', (req, res) => {
 });
 
 app.post('/request-vote', (req, res) => {
-
     if (isNetworkPartitioned) {
-        // Return a simulated network timeout error
         return res.status(503).json({ error: "Network unreachable" }); 
     }
     
     const { term, candidateId } = req.body;
+    console.log(`\n[Replica ${REPLICA_ID}] 📥 Received vote request from ${candidateId} for Term ${term}. (My Term: ${currentTerm}, My VotedFor: ${votedFor})`);
 
     if (typeof term !== 'number' || !candidateId) {
+        console.log(`[Replica ${REPLICA_ID}] 🚫 Rejecting: Malformed request.`);
         return res.status(400).json({ voteGranted: false, term: currentTerm });
     }
 
     if (term < currentTerm) {
+        console.log(`[Replica ${REPLICA_ID}] 🚫 Rejecting: Candidate term (${term}) is older than mine (${currentTerm}).`);
         return res.json({ voteGranted: false, term: currentTerm });
     }
 
     if (term > currentTerm) {
+        console.log(`[Replica ${REPLICA_ID}] 📈 Candidate term (${term}) is newer. Updating my term and clearing votedFor.`);
         currentTerm = term;
         votedFor = null;
         if (state !== 'FOLLOWER') {
@@ -397,11 +413,13 @@ app.post('/request-vote', (req, res) => {
         persistState();
     }
 
-        if (votedFor !== null && votedFor !== candidateId) {
-            resetElectionTimer();
+    if (votedFor !== null && votedFor !== candidateId) {
+        console.log(`[Replica ${REPLICA_ID}] 🚫 Rejecting: I already voted for ${votedFor} in this term.`);
+        resetElectionTimer();
         return res.json({ voteGranted: false, term: currentTerm });
     }
 
+    console.log(`[Replica ${REPLICA_ID}] ✅ Granting vote to ${candidateId} for Term ${currentTerm}.`);
     votedFor = candidateId;
     persistState();
     resetElectionTimer();
