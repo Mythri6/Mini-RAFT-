@@ -1,9 +1,8 @@
 const express = require('express');
-const http = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
 const path = require('path');
-
+const http = require('http');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
@@ -22,6 +21,8 @@ const clusterNodes = [
 // We need a lock to prevent spamming the cluster with election checks
 let isSearchingForLeader = false;
 let leaderSearchPromise = null;
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const axiosInstance = axios.create({ httpAgent });
 
 async function findLeader(force = false) {
     if (isSearchingForLeader && leaderSearchPromise) {
@@ -67,18 +68,19 @@ async function findLeader(force = false) {
 
 async function requestViaLeader(requestFn) {
     let leader = currentLeader || await findLeader();
-    if (!leader) {
-        throw new Error('No active leader found');
-    }
+    if (!leader) throw new Error('No active leader found');
 
     try {
         return await requestFn(leader);
-    } catch {
-        leader = await findLeader(true);
-        if (!leader) {
-            throw new Error('No active leader found after retry');
-        }
-        return requestFn(leader);
+    } catch (error) {
+        // If the leader hangs or drops the request, instantly wipe it
+        console.log(`[Gateway] Leader ${leader} failed. Wiping from memory and retrying...`);
+        currentLeader = null; 
+        
+        leader = await findLeader(true); // Force scan for the new leader
+        if (!leader) throw new Error('No active leader found after retry');
+        
+        return requestFn(leader); // Try one more time with the new leader
     }
 }
 
@@ -110,6 +112,42 @@ void findLeader(true);
 });*/
 
 // Keep track of which rooms actually exist
+// --- UPGRADE: Ghost Room Collision Preventer ---
+async function generateUniqueRoomId() {
+    let roomId = "";
+    let isUnique = false;
+
+    while (!isUnique) {
+        // 1. Generate 5 random letters
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        roomId = '';
+        for (let i = 0; i < 5; i++) roomId += chars.charAt(Math.floor(Math.random() * chars.length));
+
+        // 2. Ask the RAFT cluster if this room is saved on their hard drives!
+        try {
+            const response = await requestViaLeader((leader) =>
+                axiosInstance.get(`${leader}/canvas/${roomId}`, { timeout: 1000 })
+            );
+            
+            if (!response.data.exists) {
+                isUnique = true; // It's safe!
+            } else {
+                console.log(`[Gateway] Ghost room ${roomId} found on disk! Generating a new one...`);
+            }
+        } catch (error) {
+            // If the cluster is completely down, just use the ID anyway to maintain availability
+            isUnique = true;
+        }
+    }
+    return roomId;
+}
+
+// Create an API endpoint so your frontend can ask for a safe ID
+app.get('/api/generate-room', async (req, res) => {
+    const newRoomId = await generateUniqueRoomId();
+    res.json({ roomId: newRoomId });
+});
+
 const activeRooms = new Set();
 
 io.on('connection', (socket) => {
@@ -217,7 +255,7 @@ io.on('connection', (socket) => {
             try { 
                 // Hit your brand new Replica endpoint
                 await requestViaLeader((leader) =>
-                    axios.delete(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
+                    axiosInstance.delete(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
                 );
             } catch(error) {}
         }
@@ -229,12 +267,12 @@ io.on('connection', (socket) => {
         try {
             // Tell the Leader to delete the stroke from memory
             await requestViaLeader((leader) =>
-                axios.delete(`${leader}/undo/${socket.roomId}/${socket.userName}`, { timeout: 1000 })
+                axiosInstance.delete(`${leader}/undo/${socket.roomId}/${socket.id}`, { timeout: 1000 })
             );
             
             // Ask the Leader for the newly updated, fixed array
             const response = await requestViaLeader((leader) =>
-                axios.get(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
+                axiosInstance.get(`${leader}/canvas/${socket.roomId}`, { timeout: 1000 })
             );
             
             // Tell EVERYONE in the room to clear their board and redraw the fixed history!

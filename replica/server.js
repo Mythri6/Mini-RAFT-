@@ -1,7 +1,9 @@
 const express = require('express');
 const axios = require('axios');
+const http = require('http'); // NEW: Required for the keepAlive HTTP Agent
 const app = express();
 app.use(express.json());
+
 
 const storage = require('./storage');
 const REPLICA_ID = process.env.REPLICA_ID || 1;
@@ -18,25 +20,45 @@ const clusterNodes = [
     'http://replica3:8083'
 ];
 
-// BONUS CHALLENGE: Network Partition Simulator
 let isNetworkPartitioned = false;
 
-// --- RAFT STATE ---
-// All nodes start as followers and participate in election.
+// THE BRICK WALL: Block all incoming traffic if partitioned
+app.use((req, res, next) => {
+    // We have to let the toggle endpoint through, otherwise we can never plug it back in!
+    if (isNetworkPartitioned && req.path !== '/toggle-partition') {
+        return res.status(503).json({ success: false, error: "Node is partitioned" });
+    }
+    next(); // If not partitioned, let the traffic through normally
+});
+
+// ==========================================
+// ENTERPRISE FIX 1: THE SOCKET POOL
+// ==========================================
+// Docker limits how many raw TCP sockets can be opened per second.
+// This forces Axios to REUSE sockets, completely eliminating the SYN-flood crashes.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const axiosInstance = axios.create({ httpAgent });
+
 const persisted = storage.loadData();
 let state = 'FOLLOWER';
 let currentTerm = persisted.currentTerm || 0;
 let votedFor = persisted.votedFor || null;
 
-// Uses Dictionaries to track multiple rooms
 let roomLogs = persisted.log || {};
 let roomCommitIndices = {};
 
 let electionTimer = null;
 let heartbeatTimer = null;
 
-// The addresses of the other nodes so the Leader knows who to send data to
 const followers = clusterNodes.filter(url => !url.endsWith(`:${PORT}`));
+
+// ==========================================
+// ENTERPRISE FIX 2: THE CIRCUIT BREAKERS
+// ==========================================
+const deadFollowers = new Set();
+const isHeartbeating = {};
+
+
 
 function persistState() {
     storage.saveState(currentTerm, roomLogs, votedFor);
@@ -60,10 +82,7 @@ function resetElectionTimer() {
         clearTimeout(electionTimer);
         electionTimer = null;
     }
-
-    if (state === 'LEADER') {
-        return;
-    }
+    if (state === 'LEADER') return;
 
     electionTimer = setTimeout(() => {
         startElection().catch((error) => {
@@ -93,36 +112,38 @@ function stepDown(nextTerm) {
 }
 
 async function sendHeartbeats() {
-    if (state !== 'LEADER') {
-        return;
-    }
+    if (isNetworkPartitioned) return;
+    if (state !== 'LEADER') return;
+    const payload = { term: currentTerm, leaderId: NODE_ID };
 
-    const payload = {
-        term: currentTerm,
-        leaderId: NODE_ID
-    };
+    followers.forEach(async (followerUrl) => {
+        // LOCK: Do not fire a 2nd heartbeat if the 1st is still hanging
+        if (isHeartbeating[followerUrl]) return;
+        isHeartbeating[followerUrl] = true;
 
-    await Promise.all(followers.map(async (followerUrl) => {
         try {
-            const response = await axios.post(`${followerUrl}/heartbeat`, payload, { timeout: 500 });
+            const response = await axiosInstance.post(`${followerUrl}/heartbeat`, payload, { timeout: 1000 });
+            deadFollowers.delete(followerUrl); // Node is alive!
+            
             if (response.data && response.data.term > currentTerm) {
                 stepDown(response.data.term);
             }
         } catch {
-            // Follower may be down; election will happen only if majority cannot sustain leadership.
+            deadFollowers.add(followerUrl); // Node is dead! Quarantine it.
+        } finally {
+            isHeartbeating[followerUrl] = false;
         }
-    }));
+    });
 }
 
 function startHeartbeatLoop() {
     stopHeartbeatLoop();
-    void sendHeartbeats();
-    heartbeatTimer = setInterval(() => {
-        void sendHeartbeats();
-    }, HEARTBEAT_INTERVAL_MS);
+    void sendHeartbeats(); 
+    heartbeatTimer = setInterval(() => void sendHeartbeats(), HEARTBEAT_INTERVAL_MS);
 }
 
 async function startElection() {
+    if (isNetworkPartitioned) return;
     if (state === 'LEADER') return;
 
     state = 'CANDIDATE';
@@ -134,36 +155,54 @@ async function startElection() {
     console.log(`[Replica ${REPLICA_ID}] 🚀 STARTING ELECTION FOR TERM ${currentTerm}`);
     console.log(`=========================================`);
 
-    let votes = 1; // Votes for self
+    let votes = 1;
     const termAtStart = currentTerm;
     const majority = Math.floor(clusterNodes.length / 2) + 1;
 
-    await Promise.all(followers.map(async (followerUrl) => {
-        try {
-            console.log(`[Replica ${REPLICA_ID}] 📨 Asking ${followerUrl} for a vote...`);
-            const response = await axios.post(`${followerUrl}/request-vote`, {
-                term: termAtStart,
-                candidateId: NODE_ID
-            }, { timeout: 500 });
+    let finished = false;
 
-            const data = response.data || {};
-            
-            if (data.term > currentTerm) {
-                console.log(`[Replica ${REPLICA_ID}] ❌ ${followerUrl} has a higher term (${data.term}). Aborting election.`);
-                stepDown(data.term);
-                return;
-            }
+    // EARLY RESOLUTION PROMISE
+    await new Promise((resolve) => {
+        let completedRequests = 0;
 
-            if (state === 'CANDIDATE' && currentTerm === termAtStart && data.voteGranted) {
-                console.log(`[Replica ${REPLICA_ID}] ✅ Vote GRANTED by ${followerUrl}!`);
-                votes += 1;
-            } else {
-                console.log(`[Replica ${REPLICA_ID}] 🚫 Vote DENIED by ${followerUrl}.`);
+        followers.forEach(async (followerUrl) => {
+            try {
+                console.log(`[Replica ${REPLICA_ID}] 📨 Asking ${followerUrl} for a vote...`);
+                const response = await axiosInstance.post(`${followerUrl}/request-vote`, {
+                    term: termAtStart, candidateId: NODE_ID
+                }, { timeout: 500 });
+                
+                deadFollowers.delete(followerUrl); // They answered, they are alive!
+
+                const data = response.data || {};
+                
+                if (data.term > currentTerm) {
+                    console.log(`[Replica ${REPLICA_ID}] ❌ ${followerUrl} has a higher term (${data.term}). Aborting election.`);
+                    stepDown(data.term);
+                } else if (state === 'CANDIDATE' && currentTerm === termAtStart && data.voteGranted) {
+                    console.log(`[Replica ${REPLICA_ID}] ✅ Vote GRANTED by ${followerUrl}!`);
+                    votes += 1;
+                } else if (state === 'LEADER' && data.voteGranted) {
+                    // THE FIX: Catch the late "Yes" votes so they don't print as "Denied"
+                    console.log(`[Replica ${REPLICA_ID}] 📩 Late vote GRANTED by ${followerUrl}, but I already won!`);
+                } else {
+                    console.log(`[Replica ${REPLICA_ID}] 🚫 Vote DENIED by ${followerUrl}.`);
+                }
+            } catch (e) {
+                console.log(`[Replica ${REPLICA_ID}] ⚠️ Cannot reach ${followerUrl} for election.`);
+                deadFollowers.add(followerUrl); // Immediately quarantine dead node
+            } finally {
+                completedRequests++;
+                // Resolve the instant we hit majority, do not wait!
+                if (votes >= majority || completedRequests === followers.length) {
+                    if (!finished) { finished = true; resolve(); }
+                }
             }
-        } catch (e) {
-            console.log(`[Replica ${REPLICA_ID}] ⚠️ Cannot reach ${followerUrl} for election.`);
-        }
-    }));
+        });
+        
+        // FAILSAFE TIMER: Prevents Node.js from freezing infinitely
+        setTimeout(() => { if (!finished) { finished = true; resolve(); } }, 1000);
+    });
 
     if (state !== 'CANDIDATE' || currentTerm !== termAtStart) {
         console.log(`[Replica ${REPLICA_ID}] 🛑 Election interrupted. No longer candidate for term ${termAtStart}.`);
@@ -189,125 +228,113 @@ async function startElection() {
     resetElectionTimer();
 }
 
-// ENDPOINT 1: Catch data from Gateway (Leader Only)
-app.post('/client-stroke', async (req, res) => {
-    if (state !== 'LEADER') {
-        return res.status(400).json({ success: false, message: "I am not the leader." });
+// THE BRICK WALL: Block all incoming traffic if partitioned
+app.use((req, res, next) => {
+    // We have to let the toggle endpoint through, otherwise we can never plug it back in!
+    if (isNetworkPartitioned && req.path !== '/toggle-partition') {
+        return res.status(503).json({ success: false, error: "Node is partitioned" });
     }
+    next(); // If not partitioned, let the traffic through normally
+});
+
+app.post('/client-stroke', async (req, res) => {
+    if (state !== 'LEADER') return res.status(400).json({ success: false, message: "I am not the leader." });
 
     const newStroke = req.body;
     const roomId = newStroke.roomId;
 
-    // If this room doesn't exist in memory yet, create it
-    if (!roomLogs[roomId]) {
-        roomLogs[roomId] = [];
-        roomCommitIndices[roomId] = 0;
-    }
-
-    // If the room has more than 10,000 strokes, silently delete the oldest one
-    if (roomLogs[roomId].length > 10000) {
-        roomLogs[roomId].shift(); // Removes the very first item in the array
-    }
+    if (!roomLogs[roomId]) { roomLogs[roomId] = []; roomCommitIndices[roomId] = 0; }
+    if (roomLogs[roomId].length > 10000) roomLogs[roomId].shift();
 
     roomLogs[roomId].push(newStroke);
     persistState();
     const prevLogIndex = roomLogs[roomId].length - 2;
 
     console.log(`[Replica ${REPLICA_ID}] Leader received stroke. Log size for ${roomId}: ${roomLogs[roomId].length}`);
-    
-    // 1. Package the data
+
     const payload = {
-        term: currentTerm,
-        leaderId: `replica-${REPLICA_ID}`,
-        roomId: roomId, // NEW: Tell the followers WHICH room this is for
-        prevLogIndex: prevLogIndex,
-        entries: [newStroke],
-        leaderCommitIndex: roomCommitIndices[roomId]
+        term: currentTerm, leaderId: NODE_ID, roomId: roomId,
+        prevLogIndex: prevLogIndex, entries: [newStroke], leaderCommitIndex: roomCommitIndices[roomId]
     };
 
-    let successCount = 1; // Count ourselves (the Leader) as 1 success
+    let successCount = 1;
+    let finished = false;
 
-    // 2. Broadcast to Followers and handle Catch-Up
-    const syncPromises = followers.map(async (followerUrl) => {
-        try {
-            // Add { timeout: 1000 }
-            const response = await axios.post(`${followerUrl}/append-entries`, payload, { timeout: 1000 });
-            
-            if (response.data.success) {
-                console.log(`[Replica ${REPLICA_ID}] Successfully synced stroke to ${followerUrl}`);
-                successCount++; // Add their vote!
-            } 
-            else if (response.data.missingData) {
-                // THE CATCH-UP PROTOCOL 
-                console.log(`[Replica ${REPLICA_ID}] ${followerUrl} needs catch-up! Sending missing data...`);
-                
-                // Slice out the exact strokes the follower is missing
-                const missingStrokes = roomLogs[roomId].slice(response.data.followerLogLength);
-                
+    await new Promise((resolve) => {
+        let completedRequests = 0;
+
+        followers.forEach(async (followerUrl) => {
+            // CIRCUIT BREAKER: Skip known dead nodes instantly
+            if (deadFollowers.has(followerUrl)) {
+                completedRequests++;
+                if (successCount >= 2 || completedRequests === followers.length) {
+                    if (!finished) { finished = true; resolve(); }
+                }
+                return;
+            }
+
+            let nodeReplied = false;
+
+            // THE FIX: The RAFT Retry Loop! Try up to 2 times to get the stroke through.
+            for (let attempt = 1; attempt <= 2 && !nodeReplied; attempt++) {
                 try {
-                    // Force-feed the missing strokes
-                    await axios.post(`${followerUrl}/append-entries`, {
-                        term: currentTerm,
-                        leaderId: `replica-${REPLICA_ID}`,
-                        roomId: roomId, 
-                        prevLogIndex: response.data.followerLogLength - 1,
-                        entries: missingStrokes,
-                        leaderCommitIndex: roomCommitIndices[roomId]
-                    }, { timeout: 1000 }); // Add { timeout: 1000 } here too
-                    
-                    console.log(`[Replica ${REPLICA_ID}] Successfully caught up ${followerUrl}!`);
-                    successCount++; // Now their vote counts!
-                } catch (e) {
-                    console.log(`[Replica ${REPLICA_ID}] Catch-up failed for ${followerUrl}`);
+                    const response = await axiosInstance.post(`${followerUrl}/append-entries`, payload, { timeout: 2500 });
+                    deadFollowers.delete(followerUrl);
+                    nodeReplied = true; // It worked! Stop retrying.
+
+                    if (response.data.success) {
+                        successCount++;
+                    } else if (response.data.missingData) {
+                        const missingStrokes = roomLogs[roomId].slice(response.data.followerLogLength);
+                        try {
+                            await axiosInstance.post(`${followerUrl}/append-entries`, {
+                                term: currentTerm, leaderId: NODE_ID, roomId: roomId,
+                                prevLogIndex: response.data.followerLogLength - 1, entries: missingStrokes,
+                                leaderCommitIndex: roomCommitIndices[roomId]
+                            }, { timeout: 2500 });
+                            successCount++;
+                        } catch (e) { }
+                    } else if (response.data.term && response.data.term > currentTerm) {
+                        stepDown(response.data.term);
+                    }
+                } catch (error) {
+                    if (attempt === 2) {
+                        // Only log the error if both attempts failed
+                        console.log(`[Replica ${REPLICA_ID}] ⚠️ Cannot reach ${followerUrl} after 2 attempts`);
+                    }
                 }
             }
-        } catch (error) {
-            console.log(`[Replica ${REPLICA_ID}] ⚠️ Cannot reach ${followerUrl}`);
-        }
+
+            // Move to the next node / resolve the Promise
+            completedRequests++;
+            if (successCount >= 2 || completedRequests === followers.length) {
+                if (!finished) { finished = true; resolve(); }
+            }
+        });
+        
+        setTimeout(() => { if (!finished) { finished = true; resolve(); } }, 3000);
     });
 
-    // 3. Wait for all followers to reply
-    await Promise.all(syncPromises);
-
-    // 4. MAJORITY RULE
     if (successCount >= 2) {
-        roomCommitIndices[roomId] = roomLogs[roomId].length - 1; 
+        roomCommitIndices[roomId] = roomLogs[roomId].length - 1;
         console.log(`[Replica ${REPLICA_ID}] MAJORITY REACHED. Stroke committed at index ${roomCommitIndices[roomId]}.`);
-        
-        // Broadcast back to Gateway so the rest of the room sees it
-        /* try {
-            await axios.post('http://gateway:3000/broadcast', newStroke);
-        } catch (e) {} */
-
         res.json({ success: true, message: "Stroke committed to cluster" });
     } else {
         console.log(`[Replica ${REPLICA_ID}] MAJORITY FAILED. Stroke discarded.`);
-        
-        // Find the exact failed object in memory and cleanly extract it
         const failedIndex = roomLogs[roomId].indexOf(newStroke);
         if (failedIndex > -1) {
-            roomLogs[roomId].splice(failedIndex, 1); 
+            roomLogs[roomId].splice(failedIndex, 1);
             persistState();
         }
-        
         res.status(500).json({ success: false, message: "Cluster failed to reach consensus" });
     }
 });
 
-// ENDPOINT 2: Followers receive data from Leader
 app.post('/append-entries', (req, res) => {
-
-    if (isNetworkPartitioned) {
-        // Return a simulated network timeout error
-        return res.status(503).json({ error: "Network unreachable" }); 
-    }
-
+    if (isNetworkPartitioned) return res.status(503).json({ error: "Network unreachable" });
     const { term, roomId, prevLogIndex, entries, leaderCommitIndex } = req.body;
 
-    // Reject if the leader's term is outdated
-    if (term < currentTerm) {
-        return res.json({ success: false, term: currentTerm });
-    }
+    if (term < currentTerm) return res.json({ success: false, term: currentTerm });
 
     if (term > currentTerm) {
         currentTerm = term;
@@ -319,77 +346,53 @@ app.post('/append-entries', (req, res) => {
         state = 'FOLLOWER';
         stopHeartbeatLoop();
     }
-
     resetElectionTimer();
 
-    // If this room doesn't exist in memory yet, create it
-    if (!roomLogs[roomId]) {
-        roomLogs[roomId] = [];
-        roomCommitIndices[roomId] = 0;
-    }
+    if (!roomLogs[roomId]) { roomLogs[roomId] = []; roomCommitIndices[roomId] = 0; }
 
-    // THE CATCH-UP CHECK
     if (prevLogIndex >= 0 && !roomLogs[roomId][prevLogIndex]) {
         console.log(`[Replica ${REPLICA_ID}] WAIT! I am missing older strokes. Rejecting!`);
-        // Tell the leader exactly how many strokes we currently have
-        return res.json({ 
-            success: false, 
-            missingData: true, 
-            followerLogLength: roomLogs[roomId].length 
-        }); 
+        return res.json({ success: false, missingData: true, followerLogLength: roomLogs[roomId].length });
     }
 
-    // Safely apply the strokes to the EXACT index (Fixes concurrent network races)
     if (entries && entries.length > 0) {
-        // RAFT Rule: Slice off any conflicting future logs, then append the Leader's truth
-        roomLogs[roomId].splice(prevLogIndex + 1); 
+        roomLogs[roomId].splice(prevLogIndex + 1);
         roomLogs[roomId].push(...entries);
         persistState();
         console.log(`[Replica ${REPLICA_ID}] Follower saved stroke! Log size: ${roomLogs[roomId].length}`);
     }
 
-    // Keep the commit index synced with the Leader
     if (leaderCommitIndex > roomCommitIndices[roomId]) {
         roomCommitIndices[roomId] = Math.min(leaderCommitIndex, roomLogs[roomId].length - 1);
     }
-
     res.json({ success: true });
 });
 
 app.post('/heartbeat', (req, res) => {
-
-    if (isNetworkPartitioned) {
-        // Return a simulated network timeout error
-        return res.status(503).json({ error: "Network unreachable" }); 
-    }
-
+    if (isNetworkPartitioned) return res.status(503).json({ error: "Network unreachable" });
     const { term } = req.body;
 
-    if (term < currentTerm) {
-        return res.json({ success: false, term: currentTerm });
-    }
+    if (term < currentTerm) return res.json({ success: false, term: currentTerm });
 
     if (term > currentTerm) {
         currentTerm = term;
         votedFor = null;
         persistState();
     }
-
+    
     if (state !== 'FOLLOWER') {
         state = 'FOLLOWER';
         stopHeartbeatLoop();
     }
-
+    
     resetElectionTimer();
     res.json({ success: true, term: currentTerm });
 });
 
 app.post('/request-vote', (req, res) => {
-    if (isNetworkPartitioned) {
-        return res.status(503).json({ error: "Network unreachable" }); 
-    }
-    
+    if (isNetworkPartitioned) return res.status(503).json({ error: "Network unreachable" });
     const { term, candidateId } = req.body;
+
     console.log(`\n[Replica ${REPLICA_ID}] 📥 Received vote request from ${candidateId} for Term ${term}. (My Term: ${currentTerm}, My VotedFor: ${votedFor})`);
 
     if (typeof term !== 'number' || !candidateId) {
@@ -406,117 +409,85 @@ app.post('/request-vote', (req, res) => {
         console.log(`[Replica ${REPLICA_ID}] 📈 Candidate term (${term}) is newer. Updating my term and clearing votedFor.`);
         currentTerm = term;
         votedFor = null;
-        if (state !== 'FOLLOWER') {
-            state = 'FOLLOWER';
-            stopHeartbeatLoop();
+        if (state !== 'FOLLOWER') { 
+            state = 'FOLLOWER'; 
+            stopHeartbeatLoop(); 
         }
         persistState();
     }
 
     if (votedFor !== null && votedFor !== candidateId) {
         console.log(`[Replica ${REPLICA_ID}] 🚫 Rejecting: I already voted for ${votedFor} in this term.`);
-        resetElectionTimer();
+        // ==========================================
+        // ENTERPRISE FIX 3: THE SPLIT-VOTE BUG
+        // ==========================================
+        // Previously, we called resetElectionTimer() here. That was a fatal RAFT violation!
+        // A node MUST NOT reset its timer when it rejects a candidate. 
+        // Doing so forces nodes into an infinite loop of simultaneous split votes.
         return res.json({ voteGranted: false, term: currentTerm });
     }
 
     console.log(`[Replica ${REPLICA_ID}] ✅ Granting vote to ${candidateId} for Term ${currentTerm}.`);
     votedFor = candidateId;
     persistState();
-    resetElectionTimer();
+    resetElectionTimer(); // We ONLY reset the timer if we actually grant a vote
     res.json({ voteGranted: true, term: currentTerm });
 });
 
-// Delete the room from memory to save RAM
 app.delete('/room/:roomId', (req, res) => {
     const roomId = req.params.roomId;
-    delete roomLogs[roomId];
-    delete roomCommitIndices[roomId];
-    persistState(); 
-    
-    // THE FIX: Tell the followers to delete the room!
+    delete roomLogs[roomId]; delete roomCommitIndices[roomId]; persistState();
     if (state === 'LEADER') {
-        followers.forEach(followerUrl => {
-            axios.delete(`${followerUrl}/room/${roomId}`).catch(() => {});
-        });
+        followers.forEach(followerUrl => axiosInstance.delete(`${followerUrl}/room/${roomId}`).catch(() => {}));
     }
     console.log(`[Replica ${REPLICA_ID}] Room ${roomId} deleted from memory.`);
     res.json({ success: true });
 });
 
-// ENDPOINT 3: For the "Latecomer" Bug
-// Sends the entire canvas history when someone new joins
 app.get('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
-    // Explicitly tell the Gateway if this room exists in our database
-    res.json({ 
-        exists: roomLogs.hasOwnProperty(roomId), 
-        log: roomLogs[roomId] || [] 
-    });
+    res.json({ exists: roomLogs.hasOwnProperty(roomId), log: roomLogs[roomId] || [] });
 });
 
-// Wipe Canvas History
 app.delete('/canvas/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     if (roomLogs[roomId]) {
-        roomLogs[roomId] = []; 
-        persistState(); 
-        
-        // Tell the followers to wipe it too
+        roomLogs[roomId] = []; persistState();
         if (state === 'LEADER') {
-            followers.forEach(followerUrl => {
-                axios.delete(`${followerUrl}/canvas/${roomId}`).catch(() => {});
-            });
+            followers.forEach(followerUrl => axiosInstance.delete(`${followerUrl}/canvas/${roomId}`).catch(() => {}));
         }
         console.log(`[Replica ${REPLICA_ID}] Cleared history for room ${roomId}`);
     }
     res.json({ success: true });
 });
 
-// The True Undo Feature (With Cluster Sync)
-app.delete('/undo/:roomId/:userName', (req, res) => {
-    const { roomId, userName } = req.params;
-    if (!roomLogs[roomId] || roomLogs[roomId].length === 0) {
-        return res.json({ success: false });
-    }
+app.delete('/undo/:roomId/:userId', (req, res) => {
+    const { roomId, userId } = req.params;
+    if (!roomLogs[roomId] || roomLogs[roomId].length === 0) return res.json({ success: false });
 
-    // 1. Find the ID of the last stroke batch drawn by this user
     let targetStrokeId = null;
     for (let i = roomLogs[roomId].length - 1; i >= 0; i--) {
-        if (roomLogs[roomId][i].userName === userName) {
-            targetStrokeId = roomLogs[roomId][i].strokeId;
-            break;
+        // Search by userId instead of userName!
+        if (roomLogs[roomId][i].userId === userId) { 
+            targetStrokeId = roomLogs[roomId][i].strokeId; 
+            break; 
         }
     }
-
+    
     if (!targetStrokeId) return res.json({ success: false });
 
-    // 2. Filter out ALL segments that belong to that batch locally!
     roomLogs[roomId] = roomLogs[roomId].filter(stroke => stroke.strokeId !== targetStrokeId);
     persistState();
 
-    // 3. THE FIX: If I am the Leader, tell the Followers to delete it too
     if (state === 'LEADER') {
-        followers.forEach(followerUrl => {
-            // Fire a quick message to the followers so they wipe it from their RAM
-            axios.delete(`${followerUrl}/undo/${roomId}/${userName}`).catch(() => {});
-        });
+        followers.forEach(followerUrl => axiosInstance.delete(`${followerUrl}/undo/${roomId}/${userId}`).catch(() => {}));
     }
-    
-    console.log(`[Replica ${REPLICA_ID}] Undid full stroke batch for ${userName}`);
+    console.log(`[Replica ${REPLICA_ID}] Undid full stroke batch for user ID ${userId}`);
     res.json({ success: true });
 });
 
-// --- ROLE 4: STATUS API ---
 app.get('/status', (req, res) => {
-    // Upgraded to show the number of active rooms instead of array length
-    res.json({
-        replicaId: REPLICA_ID,
-        state,
-        currentTerm,
-        votedFor,
-        activeRooms: Object.keys(roomLogs).length,
-        totalLogs: Object.values(roomLogs).reduce((acc, logs) => acc + logs.length, 0)
-    });
+    res.json({ replicaId: REPLICA_ID, state, currentTerm, votedFor, activeRooms: Object.keys(roomLogs).length, totalLogs: Object.values(roomLogs).reduce((acc, logs) => acc + logs.length, 0) });
 });
 
 app.post('/toggle-partition', (req, res) => {

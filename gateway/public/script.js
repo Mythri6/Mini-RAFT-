@@ -21,12 +21,12 @@ const displayRoomId = document.getElementById('displayRoomId');
 const nameInput = document.getElementById('usernameInput');
 
 // Generate a random 5-letter code (e.g., "X7B9Q")
-function generateRoomCode() {
+/*function generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let code = '';
     for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
     return code;
-}
+}*/
 
 function enterRoom(roomId, isCreating) {
     const name = nameInput.value.trim();
@@ -52,8 +52,18 @@ function enterRoom(roomId, isCreating) {
 }
 
 // Button: Create New Room (Tells enterRoom that isCreating = true)
-document.getElementById('createRoomBtn').addEventListener('click', () => {
-    enterRoom(generateRoomCode(), true);
+document.getElementById('createRoomBtn').addEventListener('click', async () => {
+    try {
+        // 1. Ask the Gateway for a guaranteed unique room ID!
+        const response = await fetch('/api/generate-room');
+        const data = await response.json();
+        
+        // 2. Join the room using the safe ID the server gave us
+        enterRoom(data.roomId, true);
+    } catch (error) {
+        console.error("Failed to generate room:", error);
+        alert("Couldn't reach the server to create a room!");
+    }
 });
 
 // Button: Join Existing Room (Tells enterRoom that isCreating = false)
@@ -261,6 +271,7 @@ function emitStroke(startX, startY, endX, endY) {
             strokeId: currentStrokeBatchId,
             roomId: myRoomId,
             userName: myUserName,
+            userId: socket.id, 
             startX: startX, 
             startY: startY,
             endX: endX,
@@ -269,7 +280,7 @@ function emitStroke(startX, startY, endX, endY) {
             thickness: parseInt(currentWidth),
             tool: currentTool 
         };
-        
+
         // Record the stroke locally before emitting
         currentBatch.push(strokeData);
         
@@ -443,6 +454,6 @@ document.getElementById('redoBtn').addEventListener('click', () => {
             socket.emit('draw-stroke', redoStroke);
             
             i++;
-        }, 10); // A 10ms gap gives the backend CPU time to breathe
+        }, 25); // A 10ms gap gives the backend CPU time to breathe
     }
 });
