@@ -284,6 +284,27 @@ io.on('connection', (socket) => {
     });
 });
 
+// ===== DASHBOARD CLUSTER STATUS API =====
+app.get('/cluster-status', async (req, res) => {
+    const nodes = [
+        'http://replica1:8081/status',
+        'http://replica2:8082/status',
+        'http://replica3:8083/status'
+    ];
+
+    const results = await Promise.allSettled(
+        nodes.map(url =>
+            axios.get(url)
+        )
+    );
+
+    const formatted = results.map(r =>
+        r.status === "fulfilled" ? r.value.data : null
+    );
+
+    res.json(formatted);
+});
+
 const PORT = 3000;
 server.listen(PORT, () => {
     console.log(`Gateway running on http://localhost:${PORT}`);
